@@ -84,7 +84,7 @@ class MarzbanClient:
         return await self._request("GET", "/api/system/resources")
 
     async def create_user(
-        self, username: str, data_limit_bytes: int, expire_iso: str, hwid_limit: int = 0
+        self, username: str, data_limit_bytes: int, gp_id , expire_iso: str, hwid_limit: int = 0
     ) -> Dict[str, Any]:
         """ساخت کاربر جدید"""
         payload = {
@@ -94,7 +94,7 @@ class MarzbanClient:
             "hwid_limit": hwid_limit if hwid_limit > 0 else None,
             "expire": expire_iso,
             "note": "",
-            "group_ids": [3],
+            "group_ids": gp_id,
             "proxy_settings": {
                 "vmess": {},
                 "vless": {},
@@ -110,7 +110,7 @@ class MarzbanClient:
         return await self._request("GET", f"/api/user/{username}")
 
     async def update_user(
-        self, user_id: int, username: str, data_limit_bytes: int, expire_iso: str
+        self, user_id: int, gp_id , username: str, data_limit_bytes: int, expire_iso: str
     ) -> Dict[str, Any]:
         """ویرایش و تمدید کاربر"""
         payload = {
@@ -119,7 +119,7 @@ class MarzbanClient:
             "expire": expire_iso,
             "note": "",
             "data_limit_reset_strategy": "no_reset",
-            "group_ids": [3],
+            "group_ids": gp_id,
             "proxy_settings": {
                 "vmess": {},
                 "vless": {},

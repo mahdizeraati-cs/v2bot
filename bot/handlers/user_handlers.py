@@ -503,7 +503,7 @@ async def process_discount_code(
                 DiscountCode.is_active == True,
             )
         )
-    ).scalars().first()
+    ).scalar_one_or_none()
 
     if not dc:
         await message.answer(
@@ -774,6 +774,7 @@ async def process_wallet_buy(
             data_limit_bytes=data_limit_bytes,
             expire_iso=expire_iso,
             hwid_limit=plan.user_limit if plan.user_limit > 0 else 0,
+            gp_id = [3,1] if server.username == 'Mahdi@devz_1234' else [3]
         )
         if api_result:
             sub_url = str(api_result.get("subscription_url", ""))
@@ -1720,6 +1721,7 @@ async def free_test_generate(
             data_limit_bytes=data_limit_bytes,
             expire_iso=expire_iso,
             hwid_limit=hwid_limit,
+            gp_id = [3,1] if server.username == 'Mahdi@devz_1234' else [3]
         )
         if api_result:
             sub_url = str(api_result.get("subscription_url", ""))
