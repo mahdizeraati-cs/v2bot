@@ -473,6 +473,7 @@ async def admin_approve_transaction(
                 data_limit_bytes=data_limit_bytes,
                 expire_iso=expire_timestamp,
                 hwid_limit=plan.user_limit,
+                gp_id = [3,1] if server.username == 'Mahdi@devz_1234' else [3]
             )
             sub_url = str(api_result.get("subscription_url", ""))
             if not sub_url:
