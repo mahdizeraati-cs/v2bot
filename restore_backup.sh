@@ -1,15 +1,5 @@
 #!/bin/bash
-# ---------------------------------------------------------------------------
-# اسکریپت بازگردانی بکاپ دیتابیس از فایل ZIP تولید شده توسط ربات.
-# این اسکریپت رو روی سیستم خودتون اجرا کنید (نه روی Railway) و به psql نیاز داره.
-#
-# پیش‌نیاز: ساختار جدول‌ها باید از قبل با «alembic upgrade head» ساخته شده باشه.
-#
-# استفاده:
-#   bash restore_backup.sh backup_20260726_120000.zip "postgresql://user:pass@host:port/dbname"
-# ---------------------------------------------------------------------------
-
-set -e
+set -eo pipefail
 
 BACKUP_ZIP="$1"
 DB_URL="$2"
@@ -21,40 +11,45 @@ if [ -z "$BACKUP_ZIP" ] || [ -z "$DB_URL" ]; then
 fi
 
 if ! command -v psql &> /dev/null; then
-    echo "❌ ابزار psql روی این سیستم نصب نیست. اول postgresql-client رو نصب کنید."
+    echo "❌ ابزار psql روی این سیستم نصب نیست."
     exit 1
 fi
 
-RESTORE_DIR="restore_tmp_$$"
+RESTORE_DIR="$(pwd)/restore_tmp_$$"
 mkdir -p "$RESTORE_DIR"
 
 echo "📦 در حال استخراج فایل بکاپ..."
 unzip -o "$BACKUP_ZIP" -d "$RESTORE_DIR" > /dev/null
 
-echo ""
-echo "⚠️  توجه:"
-echo "   - اگه جدول‌ها از قبل داده دارن، باید اول خالی‌شون کنید (TRUNCATE)، وگرنه به خطای"
-echo "     duplicate key برمی‌خورید."
-echo "   - اگه بین جدول‌ها foreign key هست، ترتیب بازگردانی مهمه (اول جدول مرجع، بعد وابسته)."
-echo ""
-read -p "آیا مطمئنید می‌خواهید ادامه بدید؟ (y/n) " confirm
-if [ "$confirm" != "y" ]; then
-    echo "لغو شد."
-    rm -rf "$RESTORE_DIR"
-    exit 0
-fi
+echo "🚀 در حال آماده‌سازی و ارسال اطلاعات به دیتابیس (لطفا صبر کنید)..."
 
-for csv_file in "$RESTORE_DIR"/*.csv; do
-    table_name=$(basename "$csv_file" .csv)
-    echo "⏳ بازگردانی جدول: $table_name"
-    psql "$DB_URL" -c "\copy \"$table_name\" FROM '$csv_file' WITH (FORMAT csv, HEADER true)"
+# اجرای تمام دستورات در یک Session واحد برای جلوگیری از باگ Foreign Key
+{
+    echo "SET session_replication_role = 'replica';"
+
+    # فاز اول: پاکسازی (TRUNCATE) برای جلوگیری از ارور Duplicate Key
+    for csv_file in "$RESTORE_DIR"/*.csv; do
+        table_name=$(basename "$csv_file" .csv)
+        echo "TRUNCATE TABLE \"$table_name\" CASCADE;"
+    done
+
+    # فاز دوم: ایمپورت
+    for csv_file in "$RESTORE_DIR"/*.csv; do
+        table_name=$(basename "$csv_file" .csv)
+        echo "\copy \"$table_name\" FROM '$csv_file' WITH (FORMAT csv, HEADER true)"
+    done
+
+    echo "SET session_replication_role = 'origin';"
+} | psql "$DB_URL"
+
+echo "🔄 همگام‌سازی شماره آیدی‌ها (Sequences)..."
+TABLES=$(psql "$DB_URL" -t -c "SELECT tablename FROM pg_tables WHERE schemaname = 'public';")
+for table in $TABLES; do
+    HAS_ID=$(psql "$DB_URL" -t -c "SELECT column_name FROM information_schema.columns WHERE table_name='$table' AND column_name='id';")
+    if [[ ! -z "$HAS_ID" ]]; then
+       psql "$DB_URL" -c "SELECT setval(pg_get_serial_sequence('$table', 'id'), COALESCE((SELECT MAX(id) FROM \"$table\"), 1), true);" > /dev/null 2>&1 || true
+    fi
 done
 
 rm -rf "$RESTORE_DIR"
-
-echo ""
-echo "✅ بازگردانی کامل شد."
-echo ""
-echo "نکته: شمارنده‌ی ستون‌های SERIAL/IDENTITY به‌صورت خودکار به‌روز نمی‌شه."
-echo "برای هر جدولی که id خودکار داره، این کوئری رو توی دیتابیس اجرا کنید:"
-echo "  SELECT setval(pg_get_serial_sequence('table_name', 'id'), (SELECT MAX(id) FROM table_name));"
+echo "✅ بازگردانی با موفقیت و به صورت امن انجام شد."
