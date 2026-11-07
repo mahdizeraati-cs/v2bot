@@ -1,5 +1,6 @@
 from datetime import datetime
 from sqlalchemy import String, Boolean, ForeignKey, DateTime, BigInteger, Float, Integer, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -72,6 +73,10 @@ class Server(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # 🌟 [Soft Delete] حذف نرم برای حفظ یکپارچگی دادهها و گزارشهای مالی
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False , server_default="false")
+    # 🌟 نوع پنل (pasarguard | marzban | hiddify). سطرهای قدیمی = pasarguard
+    panel_type: Mapped[str] = mapped_column(String(16), default="pasarguard", server_default="pasarguard")
+    # تنظیمات اختصاصی هر نوع: verify_ssl، admin_proxy_path، client_proxy_path، sub_url_template
+    panel_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     vendor_servers = relationship("VendorServer", back_populates="server")
     transactions = relationship("Transaction", back_populates="server")
