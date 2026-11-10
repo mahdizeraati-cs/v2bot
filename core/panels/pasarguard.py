@@ -1,6 +1,6 @@
-"""آداپتور PasarGuard (رفتار موجود ربات حفظ شده؛ فقط منبع group_ids زنده است)."""
-
 from __future__ import annotations
+
+
 
 from typing import Any
 from urllib.parse import quote
@@ -14,7 +14,7 @@ from core.panels.base import (
     Target,
     UserSpec,
 )
-from core.panels.common import absolute_url, parse_expire
+from core.panels.common import absolute_url, parse_expire, encode_data_limit, encode_expire, encode_user_limit
 from core.panels.token_base import TokenPanel
 
 _PROXY_SETTINGS = {
@@ -66,18 +66,24 @@ class PasarGuardAdapter(TokenPanel):
     # ------------------------------------------------------------ users
     def _create_payload(self, spec: UserSpec, group_ids: list[int], now: float) -> dict[str, Any]:
         # ترتیب و شکل کلیدها عیناً مثل MarzbanClient.create_user قدیمی است (به‌جز group_ids).
-        expire = str(int(now) + spec.duration_days * 86400) if spec.duration_days > 0 else "0"
-        return {
+        expire_val = encode_expire("pasarguard", spec.duration_days, now)
+        data_limit_val = encode_data_limit("pasarguard", spec.data_limit_bytes)
+        hwid_limit_val = encode_user_limit("pasarguard", spec.hwid_limit)
+        
+        payload: dict[str, Any] = {
             "username": spec.username,
             "status": "active",
-            "data_limit": spec.data_limit_bytes,
-            "hwid_limit": spec.hwid_limit if spec.hwid_limit > 0 else None,
-            "expire": expire,
+            "data_limit": data_limit_val,
             "note": spec.note,
             "group_ids": group_ids,
             "proxy_settings": _PROXY_SETTINGS,
             "data_limit_reset_strategy": "no_reset",
         }
+        if expire_val is not None:
+            payload["expire"] = str(expire_val)
+        # U1c: PasarGuard unlimited user count is explicit hwid_limit: null
+        payload["hwid_limit"] = hwid_limit_val
+        return payload
 
     async def create_user(self, spec: UserSpec) -> RemoteUser:
         existing = await self.get_user(spec.username)

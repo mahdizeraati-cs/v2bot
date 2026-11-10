@@ -22,7 +22,7 @@ from core.panels.base import (
     Target,
     UserSpec,
 )
-from core.panels.common import GB
+from core.panels.common import GB, encode_data_limit, encode_expire
 from core.panels.http import PanelHTTP
 
 # Hiddify فیلد «نامحدود» ندارد؛ مقادیر بزرگ مثل کاربر پیش‌فرض خود پنل (۳۰۰۰GB / ۳۶۵۰ روز) استفاده می‌شوند.
@@ -84,8 +84,9 @@ class HiddifyAdapter:
             CredentialField("api_key", "🔑 <b>کلید API</b> (UUID ادمین):", secret=True, validator="nonempty"),
             CredentialField(
                 "client_proxy_path",
-                "👥 <b>مسیر پروکسی کاربر</b> (Client Proxy Path، برای ساخت لینک اشتراک):",
+                "👥 <b>مسیر پروکسی کاربر</b> (Client Proxy Path، برای ساخت لینک اشتراک؛ اختیاری، از لینک اشتراک کاربر استخراج می‌شود):",
                 validator="path",
+                required=False,
             ),
         ]
 
@@ -97,38 +98,78 @@ class HiddifyAdapter:
         return await self.http.request(method, f"{self._api_prefix}{path}", json=json, retries=retries)
 
     async def ping(self) -> None:
+        # First, verify panel is reachable via /panel/info/
         try:
-            await self._api("GET", "/panel/ping/", retries=0)
-        except PanelRejected as exc:
-            if exc.status != 404:
-                raise
-            # نسخه‌های دیگر فقط /panel/info/ دارند
             await self._api("GET", "/panel/info/", retries=0)
+        except PanelRejected as exc:
+            if exc.status == 404:
+                raise PanelRejected(
+                    "پنل پیدا نشد. آدرس یا مسیر ادمین (admin proxy path) اشتباه است.",
+                    status=404,
+                )
+            if exc.status in (401, 403):
+                from core.panels.base import PanelAuthError
+
+                raise PanelAuthError("کلید API (API Key) اشتباه است.", status=exc.status)
+            if exc.status >= 500:
+                from core.panels.base import PanelUnreachable
+
+                raise PanelUnreachable(f"پنل خطای سرور داد: {exc.status}")
+            raise
+        # Then, verify the API key via /admin/me/
+        try:
+            await self._api("GET", "/admin/me/", retries=0)
+        except PanelRejected as exc:
+            if exc.status in (401, 403):
+                from core.panels.base import PanelAuthError
+
+                raise PanelAuthError("کلید API (API Key) اشتباه است.", status=exc.status)
+            if exc.status == 404:
+                raise PanelRejected(
+                    "پنل پیدا نشد. آدرس یا مسیر ادمین (admin proxy path) اشتباه است.",
+                    status=404,
+                )
+            if exc.status >= 500:
+                from core.panels.base import PanelUnreachable
+
+                raise PanelUnreachable(f"پنل خطای سرور داد: {exc.status}")
+            raise
 
     async def list_targets(self) -> list[Target]:
         return []
 
     async def _get_raw(self, remote_id: str) -> dict[str, Any] | None:
+        # Try direct GET first
         try:
             body = await self._api("GET", f"/admin/user/{quote(remote_id, safe='')}/")
+            return body
         except PanelRejected as exc:
-            if exc.status == 404:
-                return None
-            raise
-        return body
+            if exc.status != 404:
+                raise
+        # Fallback: list all users and filter by UUID (H5)
+        try:
+            users = await self._api("GET", "/admin/user/")
+            if isinstance(users, list):
+                for user in users:
+                    if str(user.get("uuid", "")) == remote_id:
+                        return user
+        except PanelRejected:
+            pass
+        return None
 
     async def create_user(self, spec: UserSpec) -> RemoteUser:
         remote_id = self.remote_id_for(spec.username)
         existing = await self._get_raw(remote_id)
         if existing:
             return self._to_remote(existing)
+        now = self._today()
         payload = {
             "uuid": remote_id,
             "name": spec.username,
-            "usage_limit_GB": spec.data_limit_bytes / GB if spec.data_limit_bytes > 0 else UNLIMITED_GB,
-            "package_days": spec.duration_days if spec.duration_days > 0 else UNLIMITED_DAYS,
+            "usage_limit_GB": encode_data_limit(self.panel_type, spec.data_limit_bytes),
+            "package_days": encode_expire(self.panel_type, spec.duration_days, now=now),
             "mode": "no_reset",
-            "start_date": self._today().isoformat(),
+            "start_date": now.isoformat(),
             "enable": True,
             "comment": spec.note,
         }
@@ -198,6 +239,17 @@ class HiddifyAdapter:
     def _subscription_url(self, uid: str) -> str:
         template = str(self.config.get("sub_url_template") or DEFAULT_SUB_TEMPLATE)
         client_path = str(self.config.get("client_proxy_path", "")).strip("/")
+        
+        # If template is a full URL (contains scheme:// and no {domain} placeholder),
+        # use it as-is and only replace {uuid}
+        if (template.startswith("http://") or template.startswith("https://")) and "{domain}" not in template:
+            if "{uuid}" in template:
+                return template.replace("{uuid}", uid)
+            # If no {uuid} placeholder, append /{uid}/sub64/ or similar
+            # But this shouldn't happen with proper templates
+            return template
+        
+        # Legacy template format: uses {domain}, {client_proxy_path}, {uuid}
         if not client_path and "{client_proxy_path}" in template:
             return ""
         return template.format(

@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Sequence
 import qrcode
 from aiogram import F, Router, types
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import func, or_, select, update
@@ -39,7 +39,11 @@ from core.database.models import (
     Vendor,
     VendorServer,
 )
-from core.services.panel_client import MarzbanClient
+from core.panels import UserSpec, get_adapter, adapter_from_fields, server_kwargs_from_fields
+from core.panels.base import PanelError, PanelRejected, PanelUnreachable, PanelType, PANEL_TYPE_LABELS_FA, error_message_fa
+from core.database.crud import create_server
+from core.services.panel_client import MarzbanClient  # noqa: F401
+from bot.keyboards import get_panel_type_keyboard, get_confirm_server_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +398,20 @@ async def admin_approve_transaction(
         return
     tx_id = int(tx_id_str)
 
+    # Atomic conditional update: only process if status is "pending"
+    # This prevents double-tap refunds/credits
+    result = await db_session.execute(
+        update(Transaction)
+        .where(Transaction.id == tx_id, Transaction.status == "pending")
+        .values(status="processing")
+    )
+    if result.rowcount == 0:
+        await callback.answer(
+            "❌ این فیش قبلاً بررسی شده یا وجود ندارد.", show_alert=True
+        )
+        return
+
+    # Reload the transaction with relations
     stmt = (
         select(Transaction)
         .options(
@@ -402,13 +420,10 @@ async def admin_approve_transaction(
         )
         .where(Transaction.id == tx_id)
     )
-
     tx = (await db_session.execute(stmt)).scalar_one_or_none()
 
-    if not tx or tx.status != "pending":
-        await callback.answer(
-            "❌ این فیش قبلاً بررسی شده یا وجود ندارد.", show_alert=True
-        )
+    if not tx:
+        await callback.answer("❌ تراکنش یافت نشد.", show_alert=True)
         return
 
     user = tx.user
@@ -421,11 +436,11 @@ async def admin_approve_transaction(
         await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
         return
 
-    tx.status = "approved"
-
     random_fee = (tx.id * 73) % 899 + 1
+
     if not tx.plan_id:
-        # 🌟 شارژ عادی کیف پول (بدون خرید پلن)
+        # 🌟 شارژ عادی کیف پول (بدون خرید پلن) - لا CALL PANEL در این حالت
+        tx.status = "approved"
         user.wallet_balance += (int(tx.amount) + random_fee)
         await db_session.commit()
 
@@ -445,51 +460,96 @@ async def admin_approve_transaction(
         )
         tx.receipt_file_id = None
         await db_session.commit()
-    else:
-        # 🌟 خرید پلن (مخلوط کارت + کیف پول)
-        plan = tx.plan
-        if not plan or not plan.server:
-            await callback.answer("❌ پلن یا سرور مرتبط یافت نشد.", show_alert=True)
-            return
-        server = plan.server
+        await callback.answer()
+        return
 
-        # 🌐 ساخت کاربر واقعی در پنل Marzban
-        username = f"U_{user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
-        expire_timestamp = (
-            str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
-        )
-        data_limit_bytes = int(plan.volume_gb * 1073741824) if plan.volume_gb > 0 else 0
+    # 🌟 خرید پلن (مخلوط کارت + کیف پول)
+    plan = tx.plan
+    if not plan or not plan.server:
+        await callback.answer("❌ پلن یا سرور مرتبط یافت نشد.", show_alert=True)
+        # Mark as failed since we can't proceed
+        tx.status = "failed"
+        await db_session.commit()
+        return
+    server = plan.server
 
-        sub_url = ""
-        client = MarzbanClient(
-            base_url=server.panel_url,
-            username=server.username,
-            password=server.password,
-        )
+    # Calculate wallet_used (amount deducted from wallet in process_receipt_photo)
+    # price_after_discount = original_amount - discount
+    # wallet_used = price_after_discount - amount (where amount = payable_via_card)
+    discount_amount = int(tx.original_amount) * int(tx.discount_percent) // 100 if tx.discount_percent else 0
+    price_after_discount = int(tx.original_amount) - discount_amount
+    wallet_used = price_after_discount - int(tx.amount)
+    if wallet_used < 0:
+        wallet_used = 0
+
+    # 🌐 ساخت کاربر واقعی در پنل (via adapter)
+    username = f"U_{user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
+    data_limit_bytes = int(plan.volume_gb * 1073741824) if plan.volume_gb > 0 else 0
+    duration_days = plan.days if plan.days > 0 else 0
+    hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
+
+    spec = UserSpec(
+        username=username,
+        data_limit_bytes=data_limit_bytes,
+        duration_days=duration_days,
+        note="",
+        hwid_limit=hwid_limit,
+    )
+
+    adapter = get_adapter(server)
+    sub_url = ""
+    panel_error = None
+    try:
+        remote_user = await adapter.create_user(spec)
+        sub_url = remote_user.subscription_url
+        tx.status = "approved"
+        await db_session.flush()
+    except PanelRejected as e:
+        # Panel explicitly rejected (4xx) - refund wallet_used
+        panel_error = e
+        logger.warning(f"Panel rejected create_user for tx {tx_id}: {e}")
+        user.wallet_balance += wallet_used
+        tx.status = "failed"
+        await db_session.flush()
+    except (PanelUnreachable, asyncio.TimeoutError) as e:
+        # Panel timeout/unreachable - check if user was actually created
+        panel_error = e
+        logger.warning(f"Panel timeout/unreachable for tx {tx_id}, checking if user exists...")
+        existing = None
         try:
-            await client.login()
-            api_result = await client.create_user(
-                username=username,
-                data_limit_bytes=data_limit_bytes,
-                expire_iso=expire_timestamp,
-                hwid_limit=plan.user_limit,
-                gp_id = [1] if server.username == 'Mahdi@devz_1234' else [3]
-            )
-            sub_url = str(api_result.get("subscription_url", ""))
-            if not sub_url:
-                sub_url = "خطا در دریافت لینک اشتراک از پنل."
-        except Exception as e:
-            logger.error(f"Failed to create Marzban user {username}: {e}")
-            sub_url = f"خطا در ارتباط با پنل: {e}"
-        finally:
-            await client.close()
+            existing = await adapter.get_user(username)
+        except Exception:
+            existing = None
+        if existing:
+            # User exists in panel - deliver subscription
+            sub_url = existing.subscription_url
+            tx.status = "approved"
+            await db_session.flush()
+        else:
+            # User doesn't exist - refund wallet_used
+            user.wallet_balance += wallet_used
+            tx.status = "failed"
+            await db_session.flush()
+    except Exception as e:
+        # Unexpected error - refund wallet_used
+        panel_error = e
+        logger.error(f"Unexpected error creating user for tx {tx_id}: {e}")
+        user.wallet_balance += wallet_used
+        tx.status = "failed"
+        await db_session.flush()
+    finally:
+        await adapter.aclose()
 
-        if isinstance(callback.message, types.Message):
-            try:
-                await callback.message.delete()
-            except TelegramBadRequest:
-                pass
+    await db_session.commit()
 
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass
+
+    if tx.status == "approved" and sub_url:
+        # SUCCESS: Send subscription to customer
         msg_to_user = (
             f"✅ <b>پرداخت شما تایید شد!</b>\n\n🛍 <b>سرویس:</b> {plan.title}\n"
         )
@@ -507,40 +567,68 @@ async def admin_approve_transaction(
         )
 
         # تولید QR Code
-        if isinstance(callback.message, types.Message):
-            try:
-                import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
+        try:
+            import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
 
-                qr = qrcode.QRCode(
-                    version=1,
-                    error_correction=_qr_constants.ERROR_CORRECT_M,
-                    box_size=10,
-                    border=4,
-                )  # type: ignore[call-overload]
-                qr.add_data(sub_url)
-                qr.make(fit=True)
-                qr_image = qr.make_image(fill_color="black", back_color="white")
-                stream = io.BytesIO()
-                qr_image.save(stream, "PNG")  # type: ignore[call-arg]
-                stream.seek(0)
-                qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=_qr_constants.ERROR_CORRECT_M,
+                box_size=10,
+                border=4,
+            )  # type: ignore[call-overload]
+            qr.add_data(sub_url)
+            qr.make(fit=True)
+            qr_image = qr.make_image(fill_color="black", back_color="white")
+            stream = io.BytesIO()
+            qr_image.save(stream, "PNG")  # type: ignore[call-arg]
+            stream.seek(0)
+            qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
 
-                await bot.send_photo(
-                    chat_id=user.telegram_id,
-                    photo=qr_file,
-                    caption=msg_to_user,
-                )
-            except Exception as e:
-                logger.error(f"Failed to generate/send QR code for tx {tx_id}: {e}")
-                await bot.send_message(chat_id=user.telegram_id, text=msg_to_user)
+            await bot.send_photo(
+                chat_id=user.telegram_id,
+                photo=qr_file,
+                caption=msg_to_user,
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate/send QR code for tx {tx_id}: {e}")
+            await bot.send_message(chat_id=user.telegram_id, text=msg_to_user)
 
-        tx.receipt_file_id = None
-        await db_session.commit()
+        # Notify admin of success
+        await callback.answer("✅ تراکنش تایید و کانفیگ صادر شد.", show_alert=True)
+    else:
+        # FAILURE: Panel error, wallet refunded
+        error_text = "خطای ناشناخته"
+        if isinstance(panel_error, PanelRejected):
+            error_text = f"پنل درخواست را رد کرد: {panel_error}"
+        elif isinstance(panel_error, PanelUnreachable):
+            error_text = "سرور در دسترس نیست (timeout/unreachable)"
+        elif isinstance(panel_error, asyncio.TimeoutError):
+            error_text = "مهلت ارتباط با سرور تمام شد (timeout)"
+        else:
+            error_text = f"خطای سیستمی: {panel_error}"
 
+        # Send clear Persian error to customer (NOT as subscription)
+        await bot.send_message(
+            chat_id=user.telegram_id,
+            text=(
+                f"❌ <b>خطا در صدور کانفیگ</b>\n\n"
+                f"متاسفانه در ارتباط با سرور <b>{server.name}</b> مشکلی پیش آمد:\n"
+                f"<code>{error_text}</code>\n\n"
+                f"مبلغ <code>{wallet_used:,}</code> تومان به کیف پول شما برگشت داده شد.\n"
+                f"موجودی فعلی: <code>{int(user.wallet_balance):,}</code> تومان"
+            ),
+        )
+
+        # Notify admin of failure
+        await callback.answer(
+            f"❌ خطای پنل: {error_text}. مبلغ {wallet_used:,} تومان به کیف پول کاربر برگشت داده شد.",
+            show_alert=True
+        )
+
+    tx.receipt_file_id = None
+    await db_session.commit()
     await callback.answer()
 
-
-@router.callback_query(F.data.startswith("admin_reject_tx_"))
 async def admin_reject_transaction(
     callback: types.CallbackQuery, db_session: AsyncSession
 ):
@@ -760,7 +848,37 @@ async def start_add_server(callback: types.CallbackQuery, state: FSMContext):
         return
 
     is_selective = callback.data == "add_srv_selective"
-    await state.update_data(is_selective=is_selective, is_private=(not is_selective))
+    await state.update_data(is_selective=is_selective)
+
+    # Type-first flow: start with panel type selection
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ لغو", callback_data="admin_view_servers")]
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            "🖥 <b>افزودن سرور</b>\n\nنوع پنل را انتخاب کنید:",
+            reply_markup=get_panel_type_keyboard(),
+        )
+    await state.set_state(AddServerStates.waiting_for_panel_type)
+    await callback.answer()
+
+
+@router.callback_query(AddServerStates.waiting_for_panel_type, F.data.startswith("srv_type_"))
+async def srv_panel_type(callback: types.CallbackQuery, state: FSMContext):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    panel_type_str = callback.data.replace("srv_type_", "")
+    try:
+        panel_type = PanelType(panel_type_str)
+    except ValueError:
+        await callback.answer("❌ نوع پنل نامعتبر است.", show_alert=True)
+        return
+
+    await state.update_data(panel_type=panel_type)
 
     cancel_kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -769,7 +887,8 @@ async def start_add_server(callback: types.CallbackQuery, state: FSMContext):
     )
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(
-            "🖥 <b>افزودن سرور</b>\n\nنام سرور را وارد کنید (مثال: سرور آلمان ۱):",
+            f"🖥 <b>افزودن سرور ({{PANEL_TYPE_LABELS_FA[panel_type]}})</b>\n\n"
+            "نام سرور را وارد کنید (مثال: سرور آلمان ۱):",
             reply_markup=cancel_kb,
         )
     await state.set_state(AddServerStates.waiting_for_name)
@@ -787,13 +906,103 @@ async def srv_name(message: types.Message, state: FSMContext):
     await state.set_state(AddServerStates.waiting_for_url)
 
 
+def _parse_hiddify_admin_link(link: str) -> dict[str, str] | None:
+    """Parse Hiddify admin link to extract base_url, admin_proxy_path, api_key.
+    
+    Expected formats:
+    - https://host/<admin_path>/<admin_uuid>/admin/ (may end with /#NAME)
+    - https://host/<admin_path>/<admin_uuid>/#NAME (no /admin/ segment)
+    Returns dict with keys: base_url, admin_proxy_path, api_key
+    Returns None if parsing fails.
+    """
+    from urllib.parse import urlparse
+    
+    try:
+        parsed = urlparse(link.strip())
+        if not parsed.scheme or not parsed.netloc:
+            return None
+
+        # Remove fragment and query
+        path = parsed.path.rstrip('/')
+
+        # Split by '/' and filter empty parts
+        parts = [p for p in path.split('/') if p]
+        if len(parts) < 2:
+            return None
+
+        # Determine UUID position:
+        # If last part is 'admin', UUID is second-to-last
+        # Otherwise, UUID is last part
+        if parts[-1] == 'admin':
+            if len(parts) < 3:
+                return None
+            api_key = parts[-2]
+            admin_proxy_path = '/'.join(parts[:-2])
+        else:
+            api_key = parts[-1]
+            admin_proxy_path = '/'.join(parts[:-1])
+        
+        # Validate UUID format (basic check)
+        import uuid
+        try:
+            uuid.UUID(api_key)
+        except ValueError:
+            return None
+
+        if not admin_proxy_path or not api_key:
+            return None
+
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        return {
+            "base_url": base_url,
+            "admin_proxy_path": admin_proxy_path,
+            "api_key": api_key,
+        }
+    except Exception:
+        return None
+
+
 @router.message(AddServerStates.waiting_for_url)
-async def srv_url(message: types.Message, state: FSMContext):
+async def srv_url(message: types.Message, state: FSMContext, db_session: AsyncSession):
     if not message.text:
         return
     await state.update_data(srv_url=message.text.strip())
-    await message.answer("👤 <b>نام کاربری (Username)</b> ادمین پنل:")
-    await state.set_state(AddServerStates.waiting_for_username)
+
+    data = await state.get_data()
+    panel_type = data.get("panel_type")
+
+    if panel_type is PanelType.HIDDIFY:
+        # Parse the admin link
+        parsed = _parse_hiddify_admin_link(message.text.strip())
+        if not parsed:
+            await message.answer(
+                "\u274c <b>لینک ادمین نامعتر است.</b>\n"
+                "فرمت صحیح: <code>https://host/admin_path/admin_uuid/admin/</code>\n"
+                "(بخش #NAME در انتهای لینک نادیده می‑شود)"
+            )
+            return
+
+        # Store parsed values
+        await state.update_data(
+            base_url=parsed["base_url"],
+            admin_proxy_path=parsed["admin_proxy_path"],
+            api_key=parsed["api_key"],
+        )
+
+        # Delete the admin's message containing the sensitive link
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        # Run ping test directly with db_session
+        from bot.handlers.admin_handlers import _run_ping_and_confirm
+        await _run_ping_and_confirm(message, state, db_session)
+    else:
+        # PasarGuard / Marzban
+        await message.answer("👤 <b>نام کاربری (Username)</b> ادمین پنل:")
+        await state.set_state(AddServerStates.waiting_for_username)
 
 
 @router.message(AddServerStates.waiting_for_username)
@@ -805,13 +1014,197 @@ async def srv_user(message: types.Message, state: FSMContext):
     await state.set_state(AddServerStates.waiting_for_password)
 
 
+
+
+
 @router.message(AddServerStates.waiting_for_password)
 async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    """Handle password for PasarGuard/Marzban, then run ping test and show confirmation."""
     if not message.text or not message.from_user:
         return
 
     data = await state.get_data()
     password = message.text.strip()
+    panel_type = data.get("panel_type")
+
+    if panel_type not in (PanelType.PASARGUARD, PanelType.MARZBAN):
+        await message.answer("❌ وضعیت نامعتبر. لطفاً از منوی سرورها دوباره شروع کنید.")
+        await state.clear()
+        return
+
+    await state.update_data(password=password)
+    await _run_ping_and_confirm(message, state, db_session)
+
+
+@router.message(AddServerStates.waiting_for_sub_url_template)
+async def srv_sub_url_template(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    """Handle optional subscription URL template for Hiddify, then run ping test and show confirmation."""
+    if not message.text or not message.from_user:
+        return
+
+    data = await state.get_data()
+    panel_type = data.get("panel_type")
+
+    if panel_type is not PanelType.HIDDIFY:
+        await message.answer("❌ وضعیت نامعتبر. لطفاً از منوی سرورها دوباره شروع کنید.")
+        await state.clear()
+        return
+
+    sub_url = message.text.strip()
+    if sub_url != "-":
+        await state.update_data(sub_url_template=sub_url)
+
+    await _run_ping_and_confirm(message, state, db_session)
+
+
+@router.message(AddServerStates.waiting_for_hiddify_user_sub_link)
+async def srv_hiddify_user_sub_link(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    """Handle user subscription link for Hiddify, derive sub_url_template."""
+    if not message.text or not message.from_user:
+        return
+
+    data = await state.get_data()
+    panel_type = data.get("panel_type")
+    if panel_type is not PanelType.HIDDIFY:
+        await message.answer("❌ وضعیت نامعتبر. لطفاً از منوی سرورها دوباره شروع کنید.")
+        await state.clear()
+        return
+
+    sub_link = message.text.strip()
+    
+    # Delete the admin's message containing the sensitive user link
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    
+    # Parse the subscription link to extract UUID and path structure
+    from urllib.parse import urlparse
+    import uuid
+    
+    try:
+        parsed = urlparse(sub_link)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("Invalid URL")
+        
+        path = parsed.path.rstrip('/')
+        parts = [p for p in path.split('/') if p]
+        
+        if len(parts) < 1:
+            raise ValueError("No path components")
+        
+        # The UUID should be one of the path components
+        # Find the UUID in the path
+        found_uuid = None
+        uuid_index = -1
+        for i, part in enumerate(parts):
+            try:
+                uuid.UUID(part)
+                found_uuid = part
+                uuid_index = i
+                break
+            except ValueError:
+                continue
+        
+        if not found_uuid:
+            raise ValueError("No UUID found in path")
+        
+        # Verify the UUID exists in this panel via admin API
+        from core.panels import adapter_from_fields
+        adapter = adapter_from_fields(panel_type, data["values"])
+        try:
+            user_data = await adapter.get_user(found_uuid)
+            if user_data is None:
+                await message.answer(
+                    "❌ <b>کاربر در این پنل یافت نشد.</b>\n"
+                    "لینک اشتراک متعلق به کاربر این پنل نیست."
+                )
+                await state.clear()
+                return
+        finally:
+            await adapter.aclose()
+        
+        # Build sub_url_template from the link
+        # The template should use /sub64/ endpoint for V2rayNG compatible subscription
+        # Structure: scheme://domain/path_before_uuid/{uuid}/sub64/
+        path_before_uuid = '/'.join(parts[:uuid_index])
+        if path_before_uuid:
+            path_before_uuid = '/' + path_before_uuid + '/'
+        else:
+            path_before_uuid = '/'
+        
+        sub_url_template = f"{parsed.scheme}://{parsed.netloc}{path_before_uuid}{{uuid}}/sub64/"
+        
+        # Store the template
+        await state.update_data(sub_url_template=sub_url_template)
+        
+        # Show confirmation with masked example link
+        masked_link = f"{parsed.scheme}://{parsed.netloc}{path_before_uuid}<uuid>/sub64/"
+        
+        await message.answer(
+            f"✅ <b>لینک اشتراک معتبر است.</b>\n\n"
+            f"ساختار لینک اشتراک استخراج شد:\n"
+            f"<code>{masked_link}</code>\n\n"
+            f"آیا این ساختار درست است؟"
+        )
+        
+        # Now show the server confirmation
+        from bot.handlers.admin_handlers import _show_server_confirmation
+        await _show_server_confirmation(message, state, db_session)
+        
+    except Exception as e:
+        await message.answer(
+            f"❌ <b>لینک اشتراک نامعتبر است.</b>\n"
+            f"دلیل: {str(e)}\n"
+            f"لطفاً لینک اشتراک معتبر یک کاربر این پنل را ارسال کنید."
+        )
+        await state.clear()
+        # Don't clear state, let them try again
+
+
+async def _show_server_confirmation(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    """Show server confirmation screen after all data is collected."""
+    data = await state.get_data()
+    raw_panel_type = data.get("panel_type")
+    if not raw_panel_type:
+        await message.answer("❌ نوع پنل مشخص نشده است.")
+        await state.clear()
+        return
+    panel_type = PanelType(raw_panel_type)
+
+    type_label = PANEL_TYPE_LABELS_FA[panel_type]
+    summary_lines = [
+        f"🖥 <b>تایید ثبت سرور</b>",
+        f"",
+        f"📛 نام: {data['srv_name']}",
+        f"🔧 نوع پنل: {type_label}",
+        f"🌐 آدرس: {data.get('base_url', data.get('srv_url', ''))}",
+    ]
+    if panel_type in (PanelType.PASARGUARD, PanelType.MARZBAN):
+        summary_lines.append(f"👤 نام کاربری: {data['srv_user']}")
+    elif panel_type is PanelType.HIDDIFY:
+        summary_lines.append(f"🔧 Admin Path: {data['admin_proxy_path']}")
+        if "sub_url_template" in data:
+            summary_lines.append(f"🔗 Sub URL: {data['sub_url_template']}")
+
+    summary_text = "\n".join(summary_lines) + "\n\nآیا اطلاعات صحیح است؟"
+
+    if isinstance(message, types.Message):
+        await message.answer(summary_text, reply_markup=get_confirm_server_keyboard())
+
+
+async def _run_ping_and_confirm(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    """Build values dict, test connection via adapter, show confirmation on success."""
+    if not message.from_user:
+        return
+
+    data = await state.get_data()
+    raw_panel_type = data.get("panel_type")
+    if not raw_panel_type:
+        await message.answer("❌ نوع پنل مشخص نشده است.")
+        await state.clear()
+        return
+    panel_type = PanelType(raw_panel_type)
 
     vendor = (
         await db_session.execute(
@@ -823,109 +1216,322 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
         await state.clear()
         return
 
-    srv_url: str = str(data.get("srv_url", ""))
-    srv_user: str = str(data.get("srv_user", ""))
-    is_connected = await _test_marzban_connection(srv_url, srv_user, password)
+    # Build values dict for adapter_from_fields
+    values = {}
+    if panel_type in (PanelType.PASARGUARD, PanelType.MARZBAN):
+        values["base_url"] = data["srv_url"]
+        values["username"] = data["srv_user"]
+        values["password"] = data["password"]
+    elif panel_type is PanelType.HIDDIFY:
+        values["base_url"] = data["base_url"]
+        values["admin_proxy_path"] = data["admin_proxy_path"]
+        values["api_key"] = data["api_key"]
+        if "sub_url_template" in data:
+            values["sub_url_template"] = data["sub_url_template"]
+
+    # Test connection
+    is_connected, err_msg = await _test_panel_connection(panel_type, values)
     if not is_connected:
         await message.answer(
-            "❌ <b>اتصال به پنل ناموفق بود.</b>\n"
-            "لطفاً آدرس پنل، نام کاربری و رمز عبور را بررسی کنید و دوباره تلاش کنید.\n"
-            "برای شروع مجدد از منوی مدیریت سرورها استفاده کنید."
+            f"❌ <b>اتصال به پنل ناموفق بود.</b>\n"
+            f"دلیل: {err_msg}\n"
+            "لطفاً اطلاعات را بررسی کنید و دوباره تلاش کنید."
         )
         await state.clear()
-        text, reply_markup = await get_admin_panel_content(
-            message.from_user.id, db_session
-        )
+        text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
         if text:
             await message.answer(text, reply_markup=reply_markup)
         return
 
-    is_selective = bool(data.get("is_selective", False))
+    # Connection successful
+    await state.update_data(
+        owner_vendor_id=vendor.id,
+        values=values,  # Store for final save
+    )
+
+    if panel_type is PanelType.HIDDIFY:
+        # For Hiddify, ask for user subscription link to derive sub_url_template (H3)
+        await message.answer(
+            "✅ <b>اتصال به پنل برقرار شد.</b>\n\n"
+            "🔗 اکنون لینک اشتراک یکی از کاربران موجود این پنل را ارسال کنید.\n"
+            "این لینک برای استخراج مسیر کلاینت و ساختار URL اشتراک استفاده می‌شود.\n"
+            "(پیام شما پس از پردازش حذف خواهد شد)"
+        )
+        await state.set_state(AddServerStates.waiting_for_hiddify_user_sub_link)
+    else:
+        # For PasarGuard/Marzban, show confirmation directly
+        type_label = PANEL_TYPE_LABELS_FA[panel_type]
+        summary_lines = [
+            f"🖥 <b>تایید ثبت سرور</b>",
+            f"",
+            f"📛 نام: {data['srv_name']}",
+            f"🔧 نوع پنل: {type_label}",
+            f"🌐 آدرس: {data['srv_url']}",
+        ]
+        if panel_type in (PanelType.PASARGUARD, PanelType.MARZBAN):
+            summary_lines.append(f"👤 نام کاربری: {data['srv_user']}")
+        elif panel_type is PanelType.HIDDIFY:
+            summary_lines.append(f"🔧 Admin Path: {data['admin_proxy_path']}")
+            if "sub_url_template" in data:
+                summary_lines.append(f"🔗 Sub URL: {data['sub_url_template']}")
+
+        summary_text = "\n".join(summary_lines) + "\n\nآیا اطلاعات صحیح است؟"
+
+        if isinstance(message, types.Message):
+            await message.answer(summary_text, reply_markup=get_confirm_server_keyboard())
+
+
+async def _test_panel_connection(panel_type: PanelType, values: dict[str, str]) -> tuple[bool, str | None]:
+    """Test panel connection using adapter with given panel_type and credential values.
+    Returns (success, error_message_fa_or_None).
+    """
+    # Validate required fields based on panel type
+    if not values.get("base_url"):
+        return False, "آدرس پنل (base_url) الزامی است."
+
+    if panel_type in (PanelType.PASARGUARD, PanelType.MARZBAN):
+        if not values.get("username") or not values.get("password"):
+            return False, "نام کاربری و رمز عبور الزامی هستند."
+    elif panel_type is PanelType.HIDDIFY:
+        if not values.get("admin_proxy_path") or not values.get("api_key"):
+            return False, "Admin Path و API Key الزامی هستند."
+
+    from core.panels import adapter_from_fields
+    from core.panels.base import PanelError
+    from urllib.parse import urlparse
+
+    adapter = adapter_from_fields(panel_type, values)
+    # Log only host for security (H4)
+    base_url = values.get('base_url', '')
+    log_host = urlparse(base_url).netloc if base_url else 'unknown'
+    try:
+        await adapter.ping()
+        return True, None
+    except PanelError as e:
+        err_msg = error_message_fa(e)
+        logger.error(
+            "Panel connection test failed for host=%s: type=%s message=%r status=%s",
+            log_host, type(e).__name__, getattr(e, 'message', ''), getattr(e, 'status', None)
+        )
+        return False, err_msg
+    except Exception as e:
+        # Wrap unexpected exceptions as PanelUnreachable
+        from core.panels.base import PanelUnreachable
+        err_msg = error_message_fa(PanelUnreachable(str(e)))
+        logger.error(
+            "Panel connection test failed for host=%s: type=%s message=%r",
+            log_host, type(e).__name__, str(e)
+        )
+        return False, err_msg
+    finally:
+        await adapter.aclose()
+
+
+# Confirmation callbacks for server registration
+@router.callback_query(StateFilter("*"), F.data == "srv_confirm_save")
+async def srv_confirm_save(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    """Save the server after confirmation."""
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    raw_panel_type = data.get("panel_type")
+    raw_values = data.get("values")
+    owner_vendor_id = data.get("owner_vendor_id")
+    is_selective = data.get("is_selective", False)
+    srv_name = data.get("srv_name")
+
+    if not all([raw_panel_type, raw_values, owner_vendor_id, srv_name]):
+        await callback.answer("❌ اطلاعات ناقص است. لطفاً دوباره تلاش کنید.", show_alert=True)
+        await state.clear()
+        return
+
+    if not isinstance(raw_values, dict):
+        await callback.answer("❌ اطلاعات سرور نامعتبر است.", show_alert=True)
+        await state.clear()
+        return
+    
+    panel_type = PanelType(raw_panel_type)
+    values: dict[str, str] = raw_values
 
     if is_selective:
+        # For selective: go to vendor selection FIRST, then create server
         stmt_vendors = (
             select(Vendor)
-            .where(Vendor.is_active == True, Vendor.id != vendor.id)
+            .where(Vendor.is_active == True, Vendor.id != owner_vendor_id)
             .order_by(Vendor.id.asc())
         )
         all_vendors = (await db_session.execute(stmt_vendors)).scalars().all()
 
         if not all_vendors:
-            new_srv = Server(
-                vendor_id=vendor.id,
-                is_shared=False,
-                name=data["srv_name"],
-                panel_url=data["srv_url"],
-                username=data["srv_user"],
-                password=password,
-                is_active=True,
-            )
-            db_session.add(new_srv)
-            await db_session.commit()
+            # No vendors to share with - create as private server
+            server_kwargs = server_kwargs_from_fields(panel_type, values)
+            server_kwargs["vendor_id"] = owner_vendor_id
+            server_kwargs["name"] = srv_name
+            server_kwargs["is_shared"] = False
 
-            await message.answer(
-                "✅ <b>سرور ثبت شد.</b>\n"
-                "ℹ️ هیچ شریک فعالی برای اشتراک‌گذاری وجود نداشت، بنابراین سرور اختصاصی شما باقی ماند."
-            )
+            new_srv = await create_server(db_session, **server_kwargs)
+
+            if isinstance(callback.message, types.Message):
+                await callback.message.edit_text(
+                    f"✅ <b>سرور {srv_name} ثبت شد.</b>\n"
+                    "ℹ️ هیچ شریک فعالی برای اشتراک‌گذاری وجود نداشت، بنابراین سرور اختصاصی شما باقی ماند."
+                )
             await state.clear()
-            text, reply_markup = await get_admin_panel_content(
-                message.from_user.id, db_session
-            )
-            if text:
-                await message.answer(text, reply_markup=reply_markup)
+            text, reply_markup = await get_admin_panel_content(callback.from_user.id, db_session)
+            if text and isinstance(callback.message, types.Message):
+                await callback.message.answer(text, reply_markup=reply_markup)
+            await callback.answer()
             return
 
+        # Store data needed for later server creation
         await state.update_data(
-            srv_password=password,
-            owner_vendor_id=vendor.id,
+            panel_type=panel_type,
+            values=values,
+            owner_vendor_id=owner_vendor_id,
+            srv_name=srv_name,
             selected_vendor_ids=[],
         )
 
         kb = _build_vendor_selection_keyboard(all_vendors, selected_ids=[])
-        if isinstance(message, types.Message):
-            await message.answer(
+        if isinstance(callback.message, types.Message):
+            await callback.message.edit_text(
                 "👥 <b>مرحله اشتراک‌گذاری انتخابی</b>\n\n"
-                "سرور با موفقیت به API متصل شد.\n"
+                "اطلاعات سرور تایید شد.\n"
                 "اکنون انتخاب کنید کدام شرکا به این سرور دسترسی داشته باشند:\n"
                 "✅ = انتخاب شده | ⬜ = انتخاب نشده",
                 reply_markup=kb,
             )
         await state.set_state(AddServerStates.waiting_for_vendor_selection)
+        await callback.answer()
         return
 
-    new_srv = Server(
-        vendor_id=vendor.id,
-        is_shared=False,
-        name=data["srv_name"],
-        panel_url=data["srv_url"],
-        username=data["srv_user"],
-        password=password,
-        is_active=True,
-    )
-    db_session.add(new_srv)
-    await db_session.commit()
+    # Not selective - create server now
+    server_kwargs = server_kwargs_from_fields(panel_type, values)
+    server_kwargs["vendor_id"] = owner_vendor_id
+    server_kwargs["name"] = srv_name
+    server_kwargs["is_shared"] = False
 
-    await message.answer(f"✅ <b>سرور {data['srv_name']} ثبت شد.</b>")
+    new_srv = await create_server(db_session, **server_kwargs)
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(f"✅ <b>سرور {srv_name} با موفقیت ثبت شد.</b>")
     await state.clear()
 
-    text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
-    if text:
-        await message.answer(text, reply_markup=reply_markup)
+    text, reply_markup = await get_admin_panel_content(callback.from_user.id, db_session)
+    if text and isinstance(callback.message, types.Message):
+        await callback.message.answer(text, reply_markup=reply_markup)
+    await callback.answer()
 
 
-async def _test_marzban_connection(base_url: str, username: str, password: str) -> bool:
-    if not base_url or not username or not password:
-        return False
-    client = MarzbanClient(base_url=base_url, username=username, password=password)
-    is_connected = False
-    try:
-        is_connected = await client.login()
-    except Exception as e:
-        logger.error(f"Marzban connection test failed for {base_url}: {e}")
-        is_connected = False
-    finally:
-        await client.close()
-    return is_connected
+@router.callback_query(StateFilter("*"), F.data == "srv_edit_restart")
+async def srv_edit_restart(callback: types.CallbackQuery, state: FSMContext):
+    """Restart the server registration flow."""
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    await state.clear()
+    # Restart with the same selective/private choice
+    # We need to know if it was selective - check if we can get it from state
+    # For simplicity, restart from panel type selection
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            "🖥 <b>افزودن سرور</b>\n\nنوع پنل را انتخاب کنید:",
+            reply_markup=get_panel_type_keyboard(),
+        )
+    await state.set_state(AddServerStates.waiting_for_panel_type)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter("*"), F.data == "add_srv_cancel")
+async def srv_cancel(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    """Cancel server registration."""
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    await state.clear()
+    text, reply_markup = await get_admin_panel_content(callback.from_user.id, db_session)
+    if text and isinstance(callback.message, types.Message):
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    await callback.answer()
+
+
+@router.callback_query(AddServerStates.waiting_for_vendor_selection, F.data == "admin_view_servers")
+async def srv_vendor_cancel(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    """Cancel vendor selection - server not created yet, just clear state and show servers."""
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    await state.clear()
+    # Delegate to admin_view_servers logic
+    vendor = (
+        await db_session.execute(
+            select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ دسترسی یافت نشد.", show_alert=True)
+        return
+
+    owner_id_str = os.getenv("OWNER_ID")
+    is_owner = bool(owner_id_str and callback.from_user.id == int(owner_id_str))
+
+    shared_subq = select(VendorServer.server_id).where(
+        VendorServer.vendor_id == vendor.id
+    )
+    stmt = select(Server).where(
+        or_(Server.vendor_id == vendor.id, Server.id.in_(shared_subq)),
+        Server.is_deleted == False,
+    )
+    servers = (await db_session.execute(stmt)).scalars().all()
+
+    kb: list[list[InlineKeyboardButton]] = []
+    if is_owner:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    text="➕ افزودن سرور (اشتراک انتخابی)",
+                    callback_data="add_srv_selective",
+                )
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                text="➕ افزودن سرور اختصاصی", callback_data="add_srv_private"
+            )
+        ]
+    )
+
+    for srv in servers:
+        icon = "🟢" if srv.is_active else "🔴"
+        ownership = "مالک" if srv.vendor_id == vendor.id else "اشتراکی"
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{icon} {srv.name} ({ownership})",
+                    callback_data=f"srv_det_{srv.id}",
+                )
+            ]
+        )
+
+    kb.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel"
+            )
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            "🖥 <b>مدیریت سرورها</b>\n\nسرورهای قابل دسترس در سیستم:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        )
+    await callback.answer()
 
 
 def _build_vendor_selection_keyboard(
@@ -1003,14 +1609,13 @@ async def save_server_with_vendor_sharing(
         return
 
     data = await state.get_data()
-    required_keys = (
-        "srv_name",
-        "srv_url",
-        "srv_user",
-        "srv_password",
-        "owner_vendor_id",
-    )
-    if not all(k in data for k in required_keys):
+    raw_panel_type = data.get("panel_type")
+    raw_values = data.get("values")
+    owner_vendor_id = data.get("owner_vendor_id")
+    srv_name = data.get("srv_name")
+    selected_vendor_ids: list[int] = list(data.get("selected_vendor_ids", []))
+
+    if not all([raw_panel_type, raw_values, owner_vendor_id, srv_name]):
         await callback.answer(
             "❌ اطلاعات سرور ناقص است. لطفاً دوباره تلاش کنید.", show_alert=True
         )
@@ -1022,30 +1627,34 @@ async def save_server_with_vendor_sharing(
             await callback.message.edit_text(text, reply_markup=reply_markup)
         return
 
-    owner_vendor_id: int = int(data["owner_vendor_id"])
-    selected_vendor_ids: list[int] = list(data.get("selected_vendor_ids", []))
+    if not isinstance(raw_values, dict):
+        await callback.answer("❌ اطلاعات سرور نامعتبر است.", show_alert=True)
+        await state.clear()
+        return
 
-    new_srv = Server(
-        vendor_id=owner_vendor_id,
-        is_shared=False,
-        name=data["srv_name"],
-        panel_url=data["srv_url"],
-        username=data["srv_user"],
-        password=data["srv_password"],
-        is_active=True,
-    )
-    db_session.add(new_srv)
-    await db_session.flush()
+    panel_type = PanelType(raw_panel_type)
+    values: dict[str, str] = raw_values
 
+    # Create server now (was deferred from srv_confirm_save)
+    server_kwargs = server_kwargs_from_fields(panel_type, values)
+    server_kwargs["vendor_id"] = owner_vendor_id
+    server_kwargs["name"] = srv_name
+    server_kwargs["is_shared"] = len(selected_vendor_ids) > 0
+    server_kwargs["is_active"] = True
+
+    new_srv = await create_server(db_session, **server_kwargs)
+
+    # Add VendorServer records for selected vendors
     for vid in selected_vendor_ids:
         db_session.add(VendorServer(vendor_id=vid, server_id=new_srv.id))
 
     await db_session.commit()
+
     await state.clear()
 
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(
-            f"✅ <b>سرور {new_srv.name} با موفقیت ثبت شد.</b>\n"
+            f"✅ <b>سرور {srv_name} با موفقیت ثبت شد.</b>\n"
             f"👥 تعداد شرکای دسترسی‌یافته: <b>{len(selected_vendor_ids)}</b>"
         )
 
@@ -2941,17 +3550,15 @@ async def admin_customer_service_monitor(
     server: Server = tx.plan.server
     username = f"U_{tx.user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
 
-    client = MarzbanClient(
-        base_url=server.panel_url, username=server.username, password=server.password
-    )
-    api_data: Dict[str, Any] | None = None
+    adapter = get_adapter(server)
+    remote_user = None
     try:
-        api_data = await client.get_user(username=username)
+        remote_user = await adapter.get_user(username)
     except Exception as e:
         logger.error(f"Admin live monitoring failed for tx {tx_id}: {e}")
-        api_data = None
+        remote_user = None
     finally:
-        await client.close()
+        await adapter.aclose()
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2968,7 +3575,7 @@ async def admin_customer_service_monitor(
         ]
     )
 
-    if api_data is None:
+    if remote_user is None:
         text = (
             "📡 <b>مانیتورینگ سرویس</b>\n\n"
             f"🛍 <b>سرویس:</b> {tx.plan.title if tx.plan else 'نامشخص'}\n"
@@ -2977,39 +3584,25 @@ async def admin_customer_service_monitor(
             "لطفاً بعداً مجدداً تلاش کنید."
         )
     else:
-        data_limit = api_data.get("data_limit") or 0
-        used_traffic = api_data.get("used_traffic") or 0
-        expire_val = api_data.get("expire")
-        status = api_data.get("status") or "unknown"
+        data_limit_bytes = remote_user.data_limit_bytes
+        used_bytes = remote_user.used_bytes
+        expire_at = remote_user.expire_at
+        status = remote_user.status
 
-        total_gb = data_limit / (1024**3) if data_limit else 0.0
-        used_gb = used_traffic / (1024**3) if used_traffic else 0.0
-        remaining_gb = max(total_gb - used_gb, 0.0) if data_limit else 0.0
-
-        remaining_days = 0
-        has_expire = False
-        if expire_val:
-            try:
-                if isinstance(expire_val, str) and "T" in expire_val:
-                    dt = datetime.fromisoformat(expire_val.replace("Z", "+00:00"))
-                    expire_ts = int(dt.timestamp())
-                else:
-                    expire_ts = int(expire_val)
-                remaining_seconds = expire_ts - int(time.time())
-                remaining_days = max(remaining_seconds // 86400, 0)
-                has_expire = True
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Failed to parse expire value '{expire_val}': {e}")
-                has_expire = False
-
-        if data_limit > 0:
+        if data_limit_bytes > 0:
+            total_gb = data_limit_bytes / (1024**3)
+            used_gb = used_bytes / (1024**3)
+            remaining_gb = max(total_gb - used_gb, 0.0)
             total_text = f"{total_gb:.2f} GB"
             remaining_text = f"{remaining_gb:.2f} GB"
         else:
             total_text = "نامحدود ∞"
             remaining_text = "نامحدود ∞"
+            used_gb = used_bytes / (1024**3)
 
-        if has_expire:
+        if expire_at is not None:
+            remaining_seconds = max(int(expire_at.timestamp()) - int(time.time()), 0)
+            remaining_days = remaining_seconds // 86400
             days_text = f"{remaining_days} روز"
         else:
             days_text = "نامحدود ∞"

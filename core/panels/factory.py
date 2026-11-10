@@ -47,7 +47,15 @@ def server_kwargs_from_fields(panel_type: PanelType, values: dict[str, str]) -> 
     config: dict[str, Any] = {}
     if panel_type is PanelType.HIDDIFY:
         config["admin_proxy_path"] = values["admin_proxy_path"].strip().strip("/")
-        config["client_proxy_path"] = values["client_proxy_path"].strip().strip("/")
+        # client_proxy_path is now optional; derived from user subscription link (H3)
+        if "client_proxy_path" in values:
+            config["client_proxy_path"] = values["client_proxy_path"].strip().strip("/")
+        # sub_url_template from user subscription link (H3)
+        if "sub_url_template" in values:
+            config["sub_url_template"] = values["sub_url_template"]
+        # verify_ssl for SSL certificate verification (default True)
+        if "verify_ssl" in values:
+            config["verify_ssl"] = values["verify_ssl"] in (True, "true", "1", "yes")
         return {
             "panel_type": panel_type.value,
             "panel_url": values["base_url"].strip().rstrip("/"),

@@ -1,7 +1,8 @@
 import os
+from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
-from core.database.models import User, Vendor
+from core.database.models import User, Vendor, Server
 
 async def _get_next_vendor_round_robin(session: AsyncSession) -> int | None:
     """انتخاب نوبتی وندور (Round Robin) با استفاده از کوئریهای دیتابیس"""
@@ -95,3 +96,31 @@ async def get_or_create_user(
     await session.refresh(new_user)
 
     return new_user
+
+
+async def create_server(
+    session: AsyncSession,
+    name: str,
+    panel_url: str,
+    username: str,
+    password: str,
+    panel_type: str = "pasarguard",
+    panel_config: dict[str, Any] | None = None,
+    vendor_id: int | None = None,
+    is_shared: bool = False,
+) -> Server:
+    """Create a new server with panel_type and panel_config."""
+    server = Server(
+        name=name,
+        panel_url=panel_url,
+        username=username,
+        password=password,
+        panel_type=panel_type,
+        panel_config=panel_config,
+        vendor_id=vendor_id,
+        is_shared=is_shared,
+    )
+    session.add(server)
+    await session.commit()
+    await session.refresh(server)
+    return server

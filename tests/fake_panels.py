@@ -118,12 +118,14 @@ class FakePasarGuard(FakeTokenPanel):
             return _json({"detail": "Group not found"}, 400)
         if payload["username"] in self.users:
             return _json({"detail": "User already exists"}, 409)
+        # expire key may be omitted for unlimited (PasarGuard)
+        expire_raw = payload.get("expire")
         user = {
             "username": payload["username"],
             "status": "active",
             "used_traffic": 0,
             "data_limit": payload["data_limit"],
-            "expire": int(payload["expire"]) or None,
+            "expire": int(expire_raw) if expire_raw is not None else None,
             "subscription_url": f"/sub/{payload['username']}",
             "group_ids": payload["group_ids"],
         }
@@ -214,6 +216,7 @@ class FakeHiddify(FakePanel):
         app = web.Application()
         app.router.add_get(f"{self.PREFIX}/panel/ping/", self.ping)
         app.router.add_get(f"{self.PREFIX}/panel/info/", self.info)
+        app.router.add_get(f"{self.PREFIX}/admin/me/", self.me)
         app.router.add_post(f"{self.PREFIX}/admin/user/", self.create)
         app.router.add_get(f"{self.PREFIX}/admin/user/{{u}}/", self.get)
         app.router.add_patch(f"{self.PREFIX}/admin/user/{{u}}/", self.patch)
@@ -239,6 +242,19 @@ class FakeHiddify(FakePanel):
         if not self._auth(request):
             return self._denied()
         return _json({"version": "12.0"})
+
+    async def me(self, request: web.Request) -> web.Response:
+        if not self._auth(request):
+            return self._denied()
+        return _json({
+            "uuid": self.api_key,
+            "name": "admin",
+            "telegram_id": 123456,
+            "can_add_admin": True,
+            "comment": "",
+            "lang": "en",
+            "mode": "owner",
+        })
 
     async def create(self, request: web.Request) -> web.Response:
         if not self._auth(request):

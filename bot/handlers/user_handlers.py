@@ -1,6 +1,6 @@
 import io
 import logging
-import random
+import random  # noqa: F401
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -31,7 +31,9 @@ from core.database.models import (
     Vendor,
     VendorServer,
 )
-from core.services.panel_client import MarzbanClient
+from core.panels import UserSpec, get_adapter
+from core.services.panel_client import MarzbanClient  # noqa: F401
+from core.panels.base import PanelError
 
 logger = logging.getLogger(__name__)
 
@@ -753,37 +755,30 @@ async def process_wallet_buy(
     server = plan.server
     username = f"U_{user.telegram_id}_{new_tx.id}_{int(new_tx.created_at.timestamp())}"
     data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
+    duration_days = plan.days if plan.days > 0 else 0
+    hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
 
-    # 🌟 رفع خطای Type-Hinting مرزبان با ارسال String صریح به جای None
-    expire_iso: str = (
-        str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
+    spec = UserSpec(
+        username=username,
+        data_limit_bytes=data_limit_bytes,
+        duration_days=duration_days,
+        note="",
+        hwid_limit=hwid_limit,
     )
 
-    client = MarzbanClient(
-        base_url=server.panel_url,
-        username=server.username,
-        password=server.password,
-    )
-
-    api_result = None
+    adapter = get_adapter(server)
     sub_url = ""
     try:
-        await client.login()
-        api_result = await client.create_user(
-            username=username,
-            data_limit_bytes=data_limit_bytes,
-            expire_iso=expire_iso,
-            hwid_limit=plan.user_limit if plan.user_limit > 0 else 0,
-            gp_id = [1] if server.username == 'Mahdi@devz_1234' else [3]
-        )
-        if api_result:
-            sub_url = str(api_result.get("subscription_url", ""))
+        remote_user = await adapter.create_user(spec)
+        sub_url = remote_user.subscription_url
+    except PanelError as e:
+        logger.error(f"Config creation via Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
     except Exception as e:
-        logger.error(f"Config creation via Wallet Buy failed: {e}")
+        logger.error(f"Config creation via Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
     finally:
-        await client.close()
+        await adapter.aclose()
 
-    if api_result and sub_url:
+    if sub_url:
         caption = (
             f"✅ <b>خرید شما با موفقیت انجام شد!</b>\n\n"
             f"🛍 پلن: {plan.title}\n"
@@ -1335,19 +1330,15 @@ async def process_service_monitoring(
     server: Server = tx.plan.server
     username = f"U_{tx.user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
 
-    client = MarzbanClient(
-        base_url=server.panel_url,
-        username=server.username,
-        password=server.password,
-    )
-    api_data: Optional[Dict[str, Any]] = None
+    adapter = get_adapter(server)
+    remote_user = None
     try:
-        api_data = await client.get_user(username=username)
+        remote_user = await adapter.get_user(username)
     except Exception as e:
         logger.error(f"Live monitoring failed for tx {tx_id}: {e}")
-        api_data = None
+        remote_user = None
     finally:
-        await client.close()
+        await adapter.aclose()
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1364,7 +1355,7 @@ async def process_service_monitoring(
         ]
     )
 
-    if api_data is None:
+    if remote_user is None:
         text = (
             "📡 <b>مانیتورینگ سرویس</b>\n\n"
             f"🛍 <b>سرویس:</b> {tx.plan.title if tx.plan else 'نامشخص'}\n"
@@ -1373,39 +1364,25 @@ async def process_service_monitoring(
             "لطفاً بعداً مجدداً تلاش کنید."
         )
     else:
-        data_limit = int(api_data.get("data_limit") or 0)
-        used_traffic = int(api_data.get("used_traffic") or 0)
-        expire_val = api_data.get("expire")
-        status = str(api_data.get("status") or "unknown")
+        data_limit_bytes = remote_user.data_limit_bytes
+        used_bytes = remote_user.used_bytes
+        expire_at = remote_user.expire_at
+        status = remote_user.status
 
-        total_gb = data_limit / (1024**3) if data_limit else 0.0
-        used_gb = used_traffic / (1024**3) if used_traffic else 0.0
-        remaining_gb = max(total_gb - used_gb, 0.0) if data_limit else 0.0
-
-        remaining_days = 0
-        has_expire = False
-        if expire_val is not None:
-            try:
-                if isinstance(expire_val, str) and "T" in expire_val:
-                    dt = datetime.fromisoformat(expire_val.replace("Z", "+00:00"))
-                    expire_ts = int(dt.timestamp())
-                else:
-                    expire_ts = int(expire_val)
-                remaining_seconds = expire_ts - int(time.time())
-                remaining_days = max(remaining_seconds // 86400, 0)
-                has_expire = True
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Failed to parse expire value '{expire_val}': {e}")
-                has_expire = False
-
-        if data_limit > 0:
+        if data_limit_bytes > 0:
+            total_gb = data_limit_bytes / (1024**3)
+            used_gb = used_bytes / (1024**3)
+            remaining_gb = max(total_gb - used_gb, 0.0)
             total_text = f"{total_gb:.2f} GB"
             remaining_text = f"{remaining_gb:.2f} GB"
         else:
             total_text = "نامحدود ∞"
             remaining_text = "نامحدود ∞"
+            used_gb = used_bytes / (1024**3)
 
-        if has_expire:
+        if expire_at is not None:
+            remaining_seconds = max(int(expire_at.timestamp()) - int(time.time()), 0)
+            remaining_days = remaining_seconds // 86400
             days_text = f"{remaining_days} روز"
         else:
             days_text = "نامحدود ∞"
@@ -1702,38 +1679,28 @@ async def free_test_generate(
     username = f"TEST_{user.telegram_id}_{int(time.time())}"
     data_limit_bytes = 75 * 1024 * 1024
 
-    # 🌟 رفع خطای Type-Hinting مرزبان با استفاده از String صریح
-    expire_iso: str = str(int(time.time()) + 86400)
-    hwid_limit = 1
-
-    client = MarzbanClient(
-        base_url=server.panel_url,
-        username=server.username,
-        password=server.password,
+    spec = UserSpec(
+        username=username,
+        data_limit_bytes=data_limit_bytes,
+        duration_days=1,
+        note="",
+        hwid_limit=1,
     )
 
-    api_result: Optional[Dict[str, Any]] = None
+    adapter = get_adapter(server)
     sub_url = ""
     try:
-        await client.login()
-        api_result = await client.create_user(
-            username=username,
-            data_limit_bytes=data_limit_bytes,
-            expire_iso=expire_iso,
-            hwid_limit=hwid_limit,
-            gp_id = [1] if server.username == 'Mahdi@devz_1234' else [3]
-        )
-        if api_result:
-            sub_url = str(api_result.get("subscription_url", ""))
+        remote_user = await adapter.create_user(spec)
+        sub_url = remote_user.subscription_url
     except Exception as e:
         logger.error(
             f"Free test create_user failed for user {user.telegram_id} on server {server.id}: {e}"
         )
-        api_result = None
+        sub_url = ""
     finally:
-        await client.close()
+        await adapter.aclose()
 
-    if api_result and sub_url:
+    if sub_url:
         user.has_received_test = True
         await db_session.commit()
 

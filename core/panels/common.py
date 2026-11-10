@@ -55,3 +55,63 @@ def validate_field(kind: str | None, value: str) -> str | None:
     if kind == "path" and not _PATH_RE.match(value.strip("/")):
         return "مسیر فقط می‌تواند شامل حروف انگلیسی، عدد، - و _ باشد (بدون اسلش داخلی)."
     return None
+
+
+# --- Unlimited encoding (U1a-U1d) ----------------------------------------
+#.panel_type values: "pasarguard" | "marzban" | "hiddify"
+# Returns value to PUT IN REQUEST BODY (not for storage).
+# For unlimited: PasarGuard -> omit key (return special sentinel), Marzban -> 0, Hiddify -> sentinel.
+
+def encode_expire(panel_type: str, duration_days: int, now: float) -> int | str | None:
+    """Encode duration_days for create/extend request.
+    0 (unlimited) -> PasarGuard: None (omit key), Marzban: 0, Hiddify: UNLIMITED_DAYS.
+    >0 -> unix timestamp (int) for PasarGuard/Marzban, days (int) for Hiddify.
+    Raises ValueError if duration_days < 0."""
+    if duration_days < 0:
+        raise ValueError("duration_days cannot be negative")
+    if duration_days == 0:
+        if panel_type == "pasarguard":
+            return None  # sentinel: omit key
+        if panel_type == "marzban":
+            return 0
+        # hiddify
+        from core.panels.hiddify import UNLIMITED_DAYS
+        return UNLIMITED_DAYS
+    # positive days
+    if panel_type == "hiddify":
+        return duration_days
+    return int(now) + duration_days * 86400
+
+
+def encode_data_limit(panel_type: str, data_limit_bytes: int) -> int | float | None:
+    """Encode data_limit_bytes for create/extend request.
+    0 (unlimited) -> PasarGuard: 0, Marzban: 0, Hiddify: UNLIMITED_GB.
+    >0 -> bytes (int) for PasarGuard/Marzban, GB (float) for Hiddify.
+    Raises ValueError if data_limit_bytes < 0."""
+    if data_limit_bytes < 0:
+        raise ValueError("data_limit_bytes cannot be negative")
+    if data_limit_bytes == 0:
+        if panel_type == "hiddify":
+            from core.panels.hiddify import UNLIMITED_GB
+            return UNLIMITED_GB
+        return 0
+    if panel_type == "hiddify":
+        return data_limit_bytes / (1024**3)
+    return data_limit_bytes
+
+
+def encode_user_limit(panel_type: str, hwid_limit: int) -> int | None:
+    """Encode hwid_limit for create/extend request.
+    0 (unlimited) -> PasarGuard: None (omit/null), Marzban: N/A (no such field), Hiddify: N/A.
+    >0 -> int for PasarGuard.
+    Raises ValueError if hwid_limit < 0."""
+    if hwid_limit < 0:
+        raise ValueError("hwid_limit cannot be negative")
+    if hwid_limit == 0:
+        if panel_type == "pasarguard":
+            return None
+        # Marzban/Hiddify don't have this field
+        return None
+    if panel_type == "pasarguard":
+        return hwid_limit
+    return None

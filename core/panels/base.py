@@ -73,6 +73,7 @@ class CredentialField:
     prompt_fa: str
     secret: bool = False  # پیام ادمین بعد از خواندن پاک می‌شود
     validator: str | None = None  # url | path | nonempty
+    required: bool = True  # whether this field is required
 
 
 @dataclass(frozen=True)

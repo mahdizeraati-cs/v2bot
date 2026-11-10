@@ -3,7 +3,7 @@
 Status: **draft from research; no code changed yet.** Each fact is tagged with its source.
 Sources were fetched on 2026-11-06 from the official GitHub repositories (raw files) and official docs.
 
-Legend for the VERIFY tables: **confirmed** (read in the panel's own source/docs) · **contradicted** (source disagrees with the reference note) · **unresolved** (could not be confirmed from a reachable official source; the adapter must be defensive and the item needs a live check on a real panel).
+Legend for the VERIFY tables: **VERIFIED** (cites an official docs URL or a real-panel test result) · **UNVERIFIED** (cites only repo source files, this file, or our own code; needs live confirmation).
 
 ## 0. Current panel layer in this repo (ground truth to preserve)
 
@@ -73,13 +73,13 @@ Group → inbound tags → hosts. A user in no enabled group sees **no hosts** (
 ### VERIFY resolution
 | Item | Result |
 |---|---|
-| token endpoint/format | **confirmed** (`admin.py::admin_token`) |
-| `expire` format | **confirmed (type)**: model is `datetime \| int \| None`; docs say "UTC datetime, `0` = unlimited". The bot sends a numeric **string** and works in production → keep byte-for-byte. |
-| status values / disable | **confirmed**: modify accepts `active`, `disabled`, `on_hold`; dedicated `PUT …/disabled` exists. `limited`/`expired` are read-only states (docstring). |
-| `GET /api/groups` envelope & fields | **confirmed** (`GroupsResponse`, `GroupResponse`) |
-| `subscription_url` absolute? | **unresolved**: field is a plain string, generated in the operation/subscription layer that I did not fetch. Adapter must normalise (prefix `panel_config.sub_url_template`/panel origin when it starts with `/`). |
-| username rules | **confirmed**: 3–128 chars, `[a-zA-Z0-9-_@.]`, no consecutive special chars (`UserValidator.validate_username`). |
-| restricted admins | **confirmed**: `allowed_group_ids` restricts both listing and assignment (`permissions.py`) → only send IDs returned by the live listing with the bot's own credentials. |
+| token endpoint/format | **UNVERIFIED** (cites `admin.py::admin_token` — repo source only) |
+| `expire` format | **UNVERIFIED** (cites model/docs — repo source only; no real-panel confirmation) |
+| status values / disable | **UNVERIFIED** (cites docstring — repo source only) |
+| `GET /api/groups` envelope & fields | **UNVERIFIED** (cites `GroupsResponse`, `GroupResponse` — repo source only) |
+| `subscription_url` absolute? | **UNVERIFIED** (unresolved; no official URL or real-panel result) |
+| username rules | **UNVERIFIED** (cites `UserValidator.validate_username` — repo source only) |
+| restricted admins | **UNVERIFIED** (cites `permissions.py` — repo source only) | |
 
 ## 2. Marzban
 
@@ -109,13 +109,13 @@ Response: `UserResponse` with `username, status, used_traffic, lifetime_used_tra
 ### VERIFY resolution
 | Item | Result |
 |---|---|
-| `GET /api/inbounds` shape | **confirmed** (`Dict[ProxyTypes, List[ProxyInbound]]`) |
-| omitted `inbounds` = all of the given protocols | **confirmed** (`UserCreate.validate_inbounds` fills every tag per protocol), but the adapter will still send them explicitly. Inbounds for protocols not in `proxies` are silently dropped. |
-| username rules | **confirmed**: regex `^(?=\w{3,32}\b)[a-zA-Z0-9-_@.]+…` → **3–32 chars** (the bot's current naming can reach 32). |
-| `subscription_url` absolute/relative | **confirmed possible relative**: built as `{XRAY_SUBSCRIPTION_URL_PREFIX}/{XRAY_SUBSCRIPTION_PATH}/{token}`; empty prefix ⇒ relative. Adapter normalises; `panel_config.sub_url_template` overrides. |
-| status values | **confirmed**: create `active`/`on_hold`; modify `active`/`disabled`/`on_hold`; read adds `limited`/`expired`. `on_hold` cannot be combined with `expire`. |
-| extend semantics | **unresolved by docs** (no API rule). Adapter rule (to unit-test and live-check): `expire` = max(now, old_expire) + days·86400 (never in the past); `data_limit` = old_limit + add_bytes (it is a total); status set back to `active` if it was `expired`/`limited`. |
-| `/docs` path | **unresolved** |
+| `GET /api/inbounds` shape | **UNVERIFIED** (cites `Dict[ProxyTypes, List[ProxyInbound]]` — repo source only) |
+| omitted `inbounds` = all of the given protocols | **UNVERIFIED** (cites `UserCreate.validate_inbounds` — repo source only) |
+| username rules | **UNVERIFIED** (cites regex from repo source only) |
+| `subscription_url` absolute/relative | **UNVERIFIED** (cites env vars from repo source only; no real-panel confirmation) |
+| status values | **UNVERIFIED** (cites repo source only) |
+| extend semantics | **UNVERIFIED** (unresolved; no official URL or real-panel result) |
+| `/docs` path | **UNVERIFIED** (unresolved; no official URL or real-panel result) |
 
 ## 3. Hiddify Manager
 
@@ -142,14 +142,14 @@ Sample create body (adapter): `{"uuid":"<deterministic uuid5>", "name":"<usernam
 ### VERIFY resolution
 | Item | Result |
 |---|---|
-| v2 user endpoints | **confirmed** (routes above) |
-| header auth | **confirmed** (`auth.py`) |
-| field names / GB float units | **confirmed** (`UserSchema`) |
-| `mode` values | **unresolved**: `UserMode` enum not fetched; third-party clients report `no_reset\|daily\|weekly\|monthly`. Adapter sends `no_reset` and a live check is required. |
-| subscription URL | **contradicted** (reference expected it in the response): it must be composed `https://<domain>/<client_proxy_path>/<uuid>/`; the exact shape is **unresolved** → `panel_config.sub_url_template` (default as above) + owner confirmation. |
-| extend via `package_days`/`start_date` | **unresolved**: `PatchUserSchema` accepts both, but open issue hiddify/Hiddify-Manager#5246 reports `start_date`/`last_reset_time` not changing for an expired user on some versions. Rule to implement and live-test: active → `package_days += add_days`; expired → set `start_date = today`, `package_days = add_days`, reset usage (`current_usage_GB = 0`) — if the panel ignores it, fail with a clear `PanelRejected`/`PanelCapabilityError` instead of lying. |
-| disable/enable | **confirmed**: `enable` flag in `PatchUserSchema`. |
-| groups/inbounds | **confirmed none** → `supports_targets = False`. |
+| v2 user endpoints | **UNVERIFIED** (cites routes from repo source only) |
+| header auth | **UNVERIFIED** (cites `auth.py` — repo source only) |
+| field names / GB float units | **UNVERIFIED** (cites `UserSchema` — repo source only) |
+| `mode` values | **UNVERIFIED** (unresolved; `UserMode` enum not fetched; third-party reports only) |
+| subscription URL | **UNVERIFIED** (contradicted/unresolved; no official URL or real-panel result) |
+| extend via `package_days`/`start_date` | **UNVERIFIED** (unresolved; GitHub issue only, no real-panel confirmation) |
+| disable/enable | **UNVERIFIED** (cites `PatchUserSchema` — repo source only) |
+| groups/inbounds | **UNVERIFIED** (cites repo source only) |
 
 ## 4. Cross-panel contract decisions (for the plan)
 - Adapter module location: new package `core/panels/` (the repo has only `core/services/panel_client.py`; the old client is kept until all call sites move).
@@ -162,3 +162,43 @@ Sample create body (adapter): `{"uuid":"<deterministic uuid5>", "name":"<usernam
 1. A running PasarGuard / Marzban / Hiddify instance (or sandbox credentials) to confirm the **unresolved** rows above before the Marzban/Hiddify adapters are called "done".
 2. Hiddify: admin proxy path, client proxy path and whether subscription links use the same domain.
 3. Which `groups.read` permission the existing PasarGuard bot admins have (otherwise the `/groups/simple` fallback applies, and "disabled groups" cannot be excluded).
+
+## 6. Hiddify Registration Flow (H1-H3) — Implemented 2026-11-10
+
+### H1: Admin Link Parsing
+Admin pastes **one admin link** (format: `https://host/<admin_path>/<admin_uuid>/admin/#FRAGMENT` or `https://host/<admin_path>/<admin_uuid>/#FRAGMENT`).
+Bot extracts:
+- `base_url` = scheme + host
+- `admin_proxy_path` = `<admin_path>`
+- `api_key` = `<admin_uuid>` (the admin UUID)
+
+Admin's message is deleted after reading.
+
+### H2: Ping & Auth Verification
+`ping()` calls:
+1. `GET /<admin_path>/api/v2/panel/info/` -> must return 200
+2. `GET /<admin_path>/api/v2/admin/me/` with `Hiddify-API-Key: <admin_uuid>` header
+   - 401/403 -> `PanelAuthError` (wrong API key)
+   - 404 -> `PanelRejected` (wrong link or admin path)
+   - 5xx/timeout -> `PanelUnreachable`
+
+Admin-facing errors include endpoint name and HTTP status, **never** the link or UUID.
+
+### H3: User Subscription Link Parsing
+After successful ping, admin pastes **one user subscription link** (format: `https://subdomain/<client_path>/<user_uuid>/#FRAGMENT`).
+Bot:
+1. Strips fragment and query
+2. Extracts `<user_uuid>` from path
+3. Verifies UUID exists on panel via `GET /admin/user/<uuid>/` (with H5 list fallback)
+4. Builds `sub_url_template`: `scheme://subdomain/<client_path>/{uuid}/sub64/`
+   - Uses the **user link's domain** (may differ from admin domain)
+   - Normalizes suffix to `/sub64/`
+5. Shows masked example link to admin for confirmation
+6. Deletes admin's message containing the real user link
+
+### Adapter Changes
+- `credential_schema()`: `client_proxy_path` is now optional (derived from user sub link)
+- `_subscription_url()`: If `sub_url_template` is a full URL (starts with `http://`/`https://` and no `{domain}` placeholder), uses it verbatim with only `{uuid}` replaced
+- H5: `_get_raw()` falls back to `GET /admin/user/` + filter when direct GET returns 404
+- H6: Only Admin API used for all operations (no User API calls)
+- H4: Logs only `host`, never full URLs, proxy paths, or UUIDs

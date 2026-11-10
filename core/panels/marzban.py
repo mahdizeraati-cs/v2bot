@@ -15,7 +15,7 @@ from core.panels.base import (
     Target,
     UserSpec,
 )
-from core.panels.common import absolute_url, parse_expire
+from core.panels.common import absolute_url, parse_expire, encode_data_limit, encode_expire
 from core.panels.token_base import TokenPanel
 
 # منبع: app/models/user.py در مخزن رسمی Marzban
@@ -66,14 +66,16 @@ class MarzbanAdapter(TokenPanel):
                 inbounds.setdefault(t.protocol, []).append(t.remote_id)
         if not inbounds:
             raise PanelConfigError("هیچ اینباندی در پنل مرزبان فعال نیست.")
-        expire = int(self._clock()) + spec.duration_days * 86400 if spec.duration_days > 0 else 0
+        now = self._clock()
+        expire_val = encode_expire("marzban", spec.duration_days, now)
+        data_limit_val = encode_data_limit("marzban", spec.data_limit_bytes)
         payload = {
             "username": spec.username,
             "status": "active",
             "proxies": {proto: {} for proto in inbounds},
             "inbounds": inbounds,
-            "expire": expire,
-            "data_limit": spec.data_limit_bytes,
+            "expire": expire_val,
+            "data_limit": data_limit_val,
             "data_limit_reset_strategy": "no_reset",
             "note": spec.note,
         }

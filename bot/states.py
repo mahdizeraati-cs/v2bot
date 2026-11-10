@@ -30,10 +30,16 @@ class AdminForceJoinStates(StatesGroup):
     waiting_for_channel_data = State()
 
 class AddServerStates(StatesGroup):
+    # Type-first flow
+    waiting_for_panel_type = State()
     waiting_for_name = State()
     waiting_for_url = State()
     waiting_for_username = State()
     waiting_for_password = State()
+    # Hiddify-specific
+    waiting_for_hiddify_user_sub_link = State()
+    # Optional: subscription URL template override
+    waiting_for_sub_url_template = State()
     # 🌟 [جدید] مرحله اشتراکگذاری انتخابی سرور (Owner Only)
     waiting_for_vendor_selection = State()
 

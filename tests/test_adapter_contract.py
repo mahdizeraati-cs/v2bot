@@ -98,3 +98,85 @@ async def test_reauth_once_after_401(panel):
     panel.fake.expire_tokens()
     await a.get_user("x")
     assert panel.fake.logins == 2
+
+
+async def test_unlimited_encoding_request_body(panel):
+    """U1a-U1d: unlimited (0) encoded per panel in request body."""
+    from core.panels.common import encode_expire, encode_data_limit, encode_user_limit
+
+    spec = UserSpec(
+        username=f"U_unlimited_{panel.kind}",
+        data_limit_bytes=0,
+        duration_days=0,
+        hwid_limit=0,
+        note="unlimited test",
+    )
+    await panel.adapter.create_user(spec)
+
+    payload = panel.fake.created_payloads[-1]
+
+    if panel.kind == "pasarguard":
+        # PasarGuard: omit expire key entirely for unlimited
+        assert "expire" not in payload, f"PasarGuard should omit expire key for unlimited, got {payload.get('expire')}"
+        # data_limit: 0 is acceptable (panel treats 0 as unlimited)
+        assert payload["data_limit"] == 0
+        # U1c: PasarGuard unlimited user count is explicit hwid_limit: null
+        assert payload["hwid_limit"] is None
+    elif panel.kind == "marzban":
+        # Marzban: expire=0 (int) for unlimited
+        assert payload["expire"] == 0
+        # data_limit: 0 for unlimited
+        assert payload["data_limit"] == 0
+    elif panel.kind == "hiddify":
+        # Hiddify: package_days=UNLIMITED_DAYS (3650), usage_limit_GB=UNLIMITED_GB (100000)
+        from core.panels.hiddify import UNLIMITED_DAYS, UNLIMITED_GB
+        assert payload["package_days"] == UNLIMITED_DAYS
+        assert payload["usage_limit_GB"] == UNLIMITED_GB
+        # Note: Hiddify has no hwid_limit equivalent
+
+
+async def test_unlimited_encoding_reverse_mapping(panel):
+    """U1d: panel responses meaning unlimited map back to 0 in RemoteUser."""
+    # Create a limited user first, then test get_user with unlimited values
+    spec = UserSpec(
+        username=f"U_reverse_{panel.kind}",
+        data_limit_bytes=5 * 1024**3,
+        duration_days=30,
+        note="reverse test",
+    )
+    await panel.adapter.create_user(spec)
+
+    # Manually set fake panel user to unlimited values
+    remote_id = panel.adapter.remote_id_for(spec.username)
+    fake_user = panel.fake.users[remote_id]
+
+    if panel.kind == "pasarguard":
+        fake_user["expire"] = None  # unlimited
+        fake_user["data_limit"] = 0  # unlimited
+    elif panel.kind == "marzban":
+        fake_user["expire"] = None  # unlimited
+        fake_user["data_limit"] = 0  # unlimited
+    elif panel.kind == "hiddify":
+        from core.panels.hiddify import UNLIMITED_DAYS, UNLIMITED_GB
+        fake_user["package_days"] = UNLIMITED_DAYS
+        fake_user["usage_limit_GB"] = UNLIMITED_GB
+        fake_user["current_usage_GB"] = 0.0
+        fake_user["start_date"] = "2023-11-14"
+
+    remote = await panel.adapter.get_user(remote_id)
+    # All three should map unlimited to 0 for display
+    assert remote is not None, f"get_user returned None for {panel.kind}"
+    assert remote.data_limit_bytes == 0, f"Expected data_limit_bytes=0 for unlimited, got {remote.data_limit_bytes}"
+    assert remote.expire_at is None, f"Expected expire_at=None for unlimited, got {remote.expire_at}"
+
+
+async def test_negative_values_rejected(panel):
+    """U1d: negative values should be rejected."""
+    spec = UserSpec(
+        username=f"U_negative_{panel.kind}",
+        data_limit_bytes=-1,
+        duration_days=-1,
+        hwid_limit=-1,
+    )
+    with pytest.raises(ValueError):
+        await panel.adapter.create_user(spec)
