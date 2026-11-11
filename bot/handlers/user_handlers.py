@@ -771,6 +771,10 @@ async def process_wallet_buy(
     try:
         remote_user = await adapter.create_user(spec)
         sub_url = remote_user.subscription_url
+        # Store the actual panel UUID for Hiddify (panel may generate its own UUID)
+        new_tx.remote_user_id = remote_user.remote_id
+        new_tx.status = "approved"
+        await db_session.flush()
     except PanelError as e:
         logger.error(f"Config creation via Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
     except Exception as e:

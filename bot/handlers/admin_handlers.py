@@ -898,8 +898,9 @@ async def srv_panel_type(callback: types.CallbackQuery, state: FSMContext):
         ]
     )
     if isinstance(callback.message, types.Message):
+        type_label = PANEL_TYPE_LABELS_FA[panel_type]
         await callback.message.edit_text(
-            f"🖥 <b>افزودن سرور ({{PANEL_TYPE_LABELS_FA[panel_type]}})</b>\n\n"
+            f"🖥 <b>افزودن سرور ({type_label})</b>\n\n"
             "نام سرور را وارد کنید (مثال: سرور آلمان ۱):",
             reply_markup=cancel_kb,
         )
@@ -953,11 +954,11 @@ def _parse_hiddify_admin_link(link: str) -> dict[str, str] | None:
                 break
             except ValueError:
                 continue
-        
+
         if uuid_index == -1 or uuid_index == 0:
             # No UUID found, or UUID is the first part (no admin path)
             return None
-        
+
         api_key = parts[uuid_index]
         admin_proxy_path = '/'.join(parts[:uuid_index])
 
@@ -1083,28 +1084,28 @@ async def srv_hiddify_user_sub_link(message: types.Message, state: FSMContext, d
         return
 
     sub_link = message.text.strip()
-    
+
     # Delete the admin's message containing the sensitive user link
     try:
         await message.delete()
     except Exception:
         pass
-    
+
     # Parse the subscription link to extract UUID and path structure
     from urllib.parse import urlparse
     import uuid
-    
+
     try:
         parsed = urlparse(sub_link)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError("Invalid URL")
-        
+
         path = parsed.path.rstrip('/')
         parts = [p for p in path.split('/') if p]
-        
+
         if len(parts) < 1:
             raise ValueError("No path components")
-        
+
         # The UUID should be one of the path components
         # Find the UUID in the path
         found_uuid = None
@@ -1117,10 +1118,10 @@ async def srv_hiddify_user_sub_link(message: types.Message, state: FSMContext, d
                 break
             except ValueError:
                 continue
-        
+
         if not found_uuid:
             raise ValueError("No UUID found in path")
-        
+
         # Verify the UUID exists in this panel via admin API
         from core.panels import adapter_from_fields
         adapter = adapter_from_fields(panel_type, data["values"])
@@ -1135,7 +1136,7 @@ async def srv_hiddify_user_sub_link(message: types.Message, state: FSMContext, d
                 return
         finally:
             await adapter.aclose()
-        
+
         # Build sub_url_template from the link
         # The template should use /sub64/ endpoint for V2rayNG compatible subscription
         # Structure: scheme://domain/path_before_uuid/{uuid}/sub64/
@@ -1144,9 +1145,9 @@ async def srv_hiddify_user_sub_link(message: types.Message, state: FSMContext, d
             path_before_uuid = '/' + path_before_uuid + '/'
         else:
             path_before_uuid = '/'
-        
+
         sub_url_template = f"{parsed.scheme}://{parsed.netloc}{path_before_uuid}{{uuid}}/sub64/"
-        
+
         # Store the template in both top-level state and values dict
         values = data.get("values", {})
         values["sub_url_template"] = sub_url_template
@@ -1154,18 +1155,18 @@ async def srv_hiddify_user_sub_link(message: types.Message, state: FSMContext, d
 
         # Show confirmation with masked example link
         masked_link = f"{parsed.scheme}://{parsed.netloc}{path_before_uuid}<uuid>/sub64/"
-        
+
         await message.answer(
             f"✅ <b>لینک اشتراک معتبر است.</b>\n\n"
             f"ساختار لینک اشتراک استخراج شد:\n"
             f"<code>{html.escape(masked_link)}</code>\n\n"
             f"آیا این ساختار درست است؟"
         )
-        
+
         # Now show the server confirmation
         from bot.handlers.admin_handlers import _show_server_confirmation
         await _show_server_confirmation(message, state, db_session)
-        
+
     except Exception as e:
         await message.answer(
             f"❌ <b>لینک اشتراک نامعتبر است.</b>\n"
@@ -1365,7 +1366,7 @@ async def srv_confirm_save(callback: types.CallbackQuery, state: FSMContext, db_
         await callback.answer("❌ اطلاعات سرور نامعتبر است.", show_alert=True)
         await state.clear()
         return
-    
+
     panel_type = PanelType(raw_panel_type)
     values: dict[str, str] = raw_values
 
