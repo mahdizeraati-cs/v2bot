@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit  # noqa: F401 (quote kept for potential future use)
 
 from core.panels.base import (
     CredentialField,
@@ -98,42 +98,44 @@ class HiddifyAdapter:
         return await self.http.request(method, f"{self._api_prefix}{path}", json=json, retries=retries)
 
     async def ping(self) -> None:
-        # First, verify panel is reachable via /panel/info/
+        from core.panels.base import PanelAuthError, PanelUnreachable
+
+        # First, verify panel is reachable and API key works via /panel/info/
         try:
             await self._api("GET", "/panel/info/", retries=0)
         except PanelRejected as exc:
             if exc.status == 404:
                 raise PanelRejected(
-                    "پنل پیدا نشد. آدرس یا مسیر ادمین (admin proxy path) اشتباه است.",
-                    status=404,
-                )
+                    "پنل در /panel/info/ پیدا نشد (HTTP 404). مسیر ادمین اشتباه است.",
+                    status=exc.status,
+                ) from None
             if exc.status in (401, 403):
-                from core.panels.base import PanelAuthError
-
-                raise PanelAuthError("کلید API (API Key) اشتباه است.", status=exc.status)
+                raise PanelAuthError("کلید API (API Key) اشتباه است.", status=exc.status) from None
             if exc.status >= 500:
-                from core.panels.base import PanelUnreachable
-
-                raise PanelUnreachable(f"پنل خطای سرور داد: {exc.status}")
+                raise PanelUnreachable(f"پنل /panel/info/ خطای سرور داد: HTTP {exc.status}") from None
             raise
+        except PanelUnreachable:
+            raise PanelUnreachable(
+                "پنل /panel/info/ در دسترس نیست: مسیر ادمین اشتباه یا پنل از کار افتاده."
+            ) from None
         # Then, verify the API key via /admin/me/
         try:
             await self._api("GET", "/admin/me/", retries=0)
         except PanelRejected as exc:
             if exc.status in (401, 403):
-                from core.panels.base import PanelAuthError
-
-                raise PanelAuthError("کلید API (API Key) اشتباه است.", status=exc.status)
+                raise PanelAuthError("کلید API (API Key) اشتباه است.", status=exc.status) from None
             if exc.status == 404:
                 raise PanelRejected(
-                    "پنل پیدا نشد. آدرس یا مسیر ادمین (admin proxy path) اشتباه است.",
-                    status=404,
-                )
+                    "پنل در /admin/me/ پیدا نشد (HTTP 404). مسیر ادمین اشتباه است.",
+                    status=exc.status,
+                ) from None
             if exc.status >= 500:
-                from core.panels.base import PanelUnreachable
-
-                raise PanelUnreachable(f"پنل خطای سرور داد: {exc.status}")
+                raise PanelUnreachable(f"پنل /admin/me/ خطای سرور داد: HTTP {exc.status}") from None
             raise
+        except PanelUnreachable:
+            raise PanelUnreachable(
+                "پنل /admin/me/ در دسترس نیست: مسیر ادمین اشتباه یا پنل از کار افتاده."
+            ) from None
 
     async def list_targets(self) -> list[Target]:
         return []
@@ -141,7 +143,7 @@ class HiddifyAdapter:
     async def _get_raw(self, remote_id: str) -> dict[str, Any] | None:
         # Try direct GET first
         try:
-            body = await self._api("GET", f"/admin/user/{quote(remote_id, safe='')}/")
+            body = await self._api("GET", f"/admin/user/{remote_id}/")
             return body
         except PanelRejected as exc:
             if exc.status != 404:
@@ -157,11 +159,33 @@ class HiddifyAdapter:
             pass
         return None
 
+    async def _get_raw_by_name(self, name: str) -> dict[str, Any] | None:
+        """Find user by name (fallback for panels that generate their own UUID)."""
+        try:
+            users = await self._api("GET", "/admin/user/")
+            if isinstance(users, list):
+                for user in users:
+                    if str(user.get("name", "")) == name:
+                        return user
+        except PanelRejected:
+            pass
+        return None
+
     async def create_user(self, spec: UserSpec) -> RemoteUser:
+        if spec.data_limit_bytes < 0:
+            raise ValueError("data_limit_bytes cannot be negative")
+        if spec.duration_days < 0:
+            raise ValueError("duration_days cannot be negative")
+        if spec.hwid_limit < 0:
+            raise ValueError("hwid_limit cannot be negative")
         remote_id = self.remote_id_for(spec.username)
         existing = await self._get_raw(remote_id)
         if existing:
             return self._to_remote(existing)
+        # Fallback: check if user exists with same name (panel may generate own UUID)
+        existing_by_name = await self._get_raw_by_name(spec.username)
+        if existing_by_name:
+            return self._to_remote(existing_by_name)
         now = self._today()
         payload = {
             "uuid": remote_id,
@@ -179,6 +203,10 @@ class HiddifyAdapter:
             found = await self._get_raw(remote_id) if exc.status == 400 else None
             if found:
                 return self._to_remote(found)
+            # Also check by name in case panel created user with different UUID
+            found_by_name = await self._get_raw_by_name(spec.username) if exc.status == 400 else None
+            if found_by_name:
+                return self._to_remote(found_by_name)
             raise
         return self._to_remote(body)
 
@@ -205,18 +233,18 @@ class HiddifyAdapter:
                 patch["package_days"] = days + add_days
         if not patch:
             return self._to_remote(raw)
-        body = await self._api("PATCH", f"/admin/user/{quote(remote_id, safe='')}/", json=patch, retries=0)
+        body = await self._api("PATCH", f"/admin/user/{remote_id}/", json=patch, retries=0)
         return self._to_remote(body)
 
     async def set_enabled(self, remote_id: str, enabled: bool) -> RemoteUser:
         body = await self._api(
-            "PATCH", f"/admin/user/{quote(remote_id, safe='')}/", json={"enable": enabled}, retries=0
+            "PATCH", f"/admin/user/{remote_id}/", json={"enable": enabled}, retries=0
         )
         return self._to_remote(body)
 
     async def delete_user(self, remote_id: str) -> None:
         try:
-            await self._api("DELETE", f"/admin/user/{quote(remote_id, safe='')}/", retries=0)
+            await self._api("DELETE", f"/admin/user/{remote_id}/", retries=0)
         except PanelRejected as exc:
             if exc.status != 404:
                 raise
@@ -280,4 +308,5 @@ class HiddifyAdapter:
             used_bytes=used,
             data_limit_bytes=limit,
             expire_at=datetime(end.year, end.month, end.day, tzinfo=UTC) if end else None,
+            hwid_limit=0,  # Hiddify does not support device limits
         )

@@ -1333,7 +1333,9 @@ async def process_service_monitoring(
     adapter = get_adapter(server)
     remote_user = None
     try:
-        remote_user = await adapter.get_user(username)
+        # Use stored remote_user_id if available (Hiddify panel UUID), otherwise generate from username
+        remote_id = tx.remote_user_id or adapter.remote_id_for(username)
+        remote_user = await adapter.get_user(remote_id)
     except Exception as e:
         logger.error(f"Live monitoring failed for tx {tx_id}: {e}")
         remote_user = None

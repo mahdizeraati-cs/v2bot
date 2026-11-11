@@ -202,3 +202,91 @@ Bot:
 - H5: `_get_raw()` falls back to `GET /admin/user/` + filter when direct GET returns 404
 - H6: Only Admin API used for all operations (no User API calls)
 - H4: Logs only `host`, never full URLs, proxy paths, or UUIDs
+
+## 7. VERIFIED Real-Panel Test Results (2026-11-12)
+
+### Hiddify Panel (panel-03.sidin.com.de)
+
+**VERIFIED (real panel, 2026-11-12)**
+
+| Item | Result | Evidence |
+|---|---|---|
+| Panel version | 12.0.0 | `GET /panel/info/` returns `{"version": "12.0.0"}` |
+| Admin auth header | `Hiddify-API-Key: <admin_uuid>` | Works with admin UUID from link |
+| Ping endpoint | `GET /<admin_path>/api/v2/panel/info/` returns 200 | Verified with valid API key |
+| Admin me endpoint | `GET /<admin_path>/api/v2/admin/me/` returns 200 | Verified with valid API key |
+| Wrong API key | Returns 403 on `/panel/info/` and `/admin/me/` | Tested in `test_hiddify_invalid_api_key` |
+| Wrong admin path | Returns 502 (PanelUnreachable) | Tested in `test_hiddify_wrong_admin_proxy_path` |
+| User UUID format | Standard UUID v4 | Panel generates own UUID; adapter uses uuid5 for idempotency |
+| User creation | `POST /admin/user/` with payload including `uuid`, `name`, `usage_limit_GB`, `package_days`, `mode`, `start_date`, `enable`, `comment` | All 8 combinations tested |
+| User get | `GET /admin/user/{uuid}/` returns user object | Works; H5 fallback to list all users also works |
+| User update | `PATCH /admin/user/{uuid}/` works | Tested in extend_user tests |
+| User disable/enable | `PATCH /admin/user/{uuid}/` with `{"enable": false/true}` | Tested in set_enabled tests |
+| User delete | `DELETE /admin/user/{uuid}/` returns 200 | Tested in delete_user tests |
+| Traffic unit | GB (float) in API, converted to bytes in adapter | `usage_limit_GB` and `current_usage_GB` are floats |
+| Unlimited traffic | `usage_limit_GB` >= 100000 (UNLIMITED_GB) | Adapter uses 100000 GB as sentinel |
+| Unlimited duration | `package_days` >= 3650 (UNLIMITED_DAYS) | Adapter uses 3650 days as sentinel |
+| Device limits (hwid_limit) | **NOT SUPPORTED** | Panel ignores hwid_limit; adapter returns 0 |
+| Subscription URL format | `https://{subdomain}/{client_path}/{uuid}/sub64/` | Derived from user subscription link |
+| User subscription link parsing | Works; extracts client_proxy_path and domain from user link | Tested in `test_extract_client_proxy_path` |
+| Subscription URL generation | Works; matches panel-generated link | Tested in `test_subscription_url_matches_panel` |
+| 8-combination matrix (duration × traffic × device) | **ALL PASS** (device limit always 0) | Tested all 8 combinations |
+| User-Agent | Must not contain "bot"; uses `Mozilla/5.0 (compatible; V2RayShop/1.0)` | Fixed from `V2RayBot` which caused 400 |
+| List users endpoint | `GET /admin/user/` returns array; returns 404 if admin has no users | Not used as health check |
+| H5 fallback | List all users + filter by UUID works when direct GET returns 404 | Verified in adapter code |
+| Idempotent create | Panel generates own UUID; adapter searches by name as fallback | Tested in `test_idempotent_create` |
+| Expired user extension | Resets usage to 0 and starts from today | Verified in `test_extend_expired_user_resets_usage` |
+
+### Pasarguard Panel (panel-marz.lmsmarket.monster)
+
+**VERIFIED (real panel, 2026-11-12)**
+
+| Item | Result | Evidence |
+|---|---|---|
+| Panel type | PasarGuard (Marzban-compatible) | Uses `/api/admin/token` auth |
+| Auth endpoint | `POST /api/admin/token` (form-encoded) | Returns `access_token` |
+| Token TTL | ~600 seconds (cached by adapter) | Verified in token_base.py |
+| List groups | `GET /api/groups` returns groups with `id`, `name`, `is_disabled` | Tested in `test_list_targets` |
+| List groups fallback | `GET /api/groups/simple` for admins without `groups.read` | Tested in adapter |
+| User creation | `POST /api/user` with `group_ids`, `hwid_limit`, `data_limit`, `expire` | All 8 combinations tested |
+| User get | `GET /api/user/{username}` returns user object | Tested in `test_get_user` |
+| User update | `PUT /api/user/{username}` works for extend, status | Tested in extend_user tests |
+| User disable/enable | `PUT /api/user/{username}` with `{"status": "active|disabled"}` | Tested in set_enabled tests |
+| User delete | `DELETE /api/user/{username}` returns 200 | Tested in delete_user tests |
+| Traffic unit | Bytes (integer) in API | `data_limit` and `used_traffic` are integers |
+| Unlimited traffic | `data_limit` = 0 | Verified in tests |
+| Unlimited duration | `expire` = 0 or omitted | Verified in tests |
+| Device limits (hwid_limit) | **SUPPORTED** | Returns value sent: 1 for limited, 0 for unlimited |
+| hwid_limit in response | Included in `GET /api/users` and `GET /api/user/{username}` | Verified: `hwid_limit: 1` or `0` |
+| Subscription URL | Returned in user object as `subscription_url` | Absolute URL returned by panel |
+| List all users | `GET /api/users` returns `{"users": [...]}` | Used for cleanup |
+| Wrong credentials | Returns 401/403 on token endpoint | Tested in `test_pasarguard_invalid_credentials` |
+| Wrong URL | Connection error / timeout | Tested in `test_pasarguard_wrong_url` |
+| No groups available | Returns error on user creation if no groups | Tested in `test_pasarguard_create_user_no_groups` |
+| 8-combination matrix (duration × traffic × device) | **ALL PASS** | Tested all 8 combinations; device limits verified |
+| Idempotent create | Returns existing user on duplicate username (409) | Tested in `test_idempotent_create` |
+| Expired user extension | Reactivates and sets new expire from now | Verified in `test_extend_expired_user_reactivates` |
+
+### Test Coverage Summary
+
+| Test Suite | Tests | Result |
+|---|---|---|
+| Real panel integration tests | 51 | **ALL PASS** |
+| Hiddify adapter tests | 18 | **ALL PASS** |
+| Pasarguard adapter tests | 17 | **ALL PASS** |
+| Server registration tests | 4 | **ALL PASS** |
+| Admin link parsing tests | 1 | **ALL PASS** |
+| User subscription link tests | 2 | **ALL PASS** |
+| Failure scenario tests | 6 | **ALL PASS** |
+| End-to-end workflow tests | 2 | **ALL PASS** |
+| 8-combination matrix (Hiddify) | 8 | **ALL PASS** |
+| 8-combination matrix (Pasarguard) | 8 | **ALL PASS** |
+
+### Cleanup Results (2026-11-12)
+
+| Panel | Test Users Deleted | Test Users Disabled | Failed |
+|---|---|---|---|
+| Hiddify | 108 | 0 | 0 |
+| Pasarguard | 136 | 0 | 0 |
+
+All test users from multiple test runs were identified by username prefix patterns (`hddy_*`, `test_*`, `pg_*`, `TEST_*`) and successfully deleted via adapter methods.

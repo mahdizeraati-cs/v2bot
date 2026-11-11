@@ -1,4 +1,5 @@
 import asyncio
+import html
 import io
 import logging
 import os
@@ -502,6 +503,8 @@ async def admin_approve_transaction(
     try:
         remote_user = await adapter.create_user(spec)
         sub_url = remote_user.subscription_url
+        # Store the actual panel UUID for Hiddify (panel may generate its own UUID)
+        tx.remote_user_id = remote_user.remote_id
         tx.status = "approved"
         await db_session.flush()
     except PanelRejected as e:
@@ -517,7 +520,8 @@ async def admin_approve_transaction(
         logger.warning(f"Panel timeout/unreachable for tx {tx_id}, checking if user exists...")
         existing = None
         try:
-            existing = await adapter.get_user(username)
+            remote_id = tx.remote_user_id or adapter.remote_id_for(username)
+            existing = await adapter.get_user(remote_id)
         except Exception:
             existing = None
         if existing:
@@ -629,80 +633,88 @@ async def admin_approve_transaction(
     await db_session.commit()
     await callback.answer()
 
+@router.callback_query(F.data.startswith("admin_reject_tx_"))
 async def admin_reject_transaction(
     callback: types.CallbackQuery, db_session: AsyncSession
 ):
-    if not callback.data or not callback.from_user:
+    try:
+        if not callback.data or not callback.from_user:
+            await callback.answer()
+            return
+
+        tx_id_str = callback.data.replace("admin_reject_tx_", "")
+        if not tx_id_str.isdigit():
+            await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+            return
+        tx_id = int(tx_id_str)
+
+        tx = (
+            await db_session.execute(
+                select(Transaction)
+                .options(selectinload(Transaction.user))
+                .where(Transaction.id == tx_id)
+            )
+        ).scalar_one_or_none()
+
+        if not tx or tx.status != "pending":
+            await callback.answer("❌ فیش قبلاً بررسی شده.", show_alert=True)
+            return
+
+        user = tx.user
+        if not user:
+            await callback.answer("❌ کاربر مرتبط با این فیش یافت نشد.", show_alert=True)
+            return
+
+        bot = callback.bot
+        if not bot:
+            await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
+            return
+
+        # ---------------------------------------------------------
+        # 🌟 [سیستم بازگشت وجه - Refund]:
+        # اگر کاربر برای خرید پلن، بخشی از هزینه را از کیف پول داده و سپس فیش را برای بقیه پول ارسال کرده بوده،
+        # پولی که از کیف پولش بلاک (کسر) شده را محاسبه و دوباره به حسابش واریز (Refund) می‌کنیم!
+        # ---------------------------------------------------------
+        if tx.plan_id:
+            # ۱. قیمت واقعی پلن بعد از تخفیف را در می‌آوریم
+            actual_plan_price = int(tx.original_amount) - (
+                int(tx.original_amount) * int(tx.discount_percent or 0) // 100
+            )
+
+            # ۲. مبلغی که باید به کارت واریز می‌شده دقیقاً tx.amount است (بدون کارمزد رندوم)
+            payable_via_card = int(tx.amount)
+
+            # ۳. پس پولی که از کیف پول کاربر بلاک شده بوده دقیقاً اختلاف این دو عدد است:
+            wallet_used = actual_plan_price - payable_via_card
+
+            # ۴. اگر پولی درگیر بوده، دقیقاً همان مقدار را به حسابش برمی‌گردانیم
+            if wallet_used > 0:
+                user.wallet_balance += wallet_used
+        tx.status = "rejected"
+        await db_session.commit()
+
+        if isinstance(callback.message, types.Message):
+            try:
+                await callback.message.delete()
+            except TelegramBadRequest:
+                pass
+
+        if isinstance(callback.message, types.Message):
+            await bot.send_message(
+                chat_id=user.telegram_id,
+                text=(
+                    f"❌ <b>پرداخت شما تایید نشد.</b>\n\n"
+                    f"فیش ارسالی برای مبلغ <code>{int(tx.amount):,}</code> تومان توسط پشتیبانی رد شد.\n"
+                    "در صورتی که مبلغی از کیف پول شما کسر شده بود، به حساب شما بازگردانده شد."
+                ),
+            )
         await callback.answer()
-        return
-
-    tx_id_str = callback.data.replace("admin_reject_tx_", "")
-    if not tx_id_str.isdigit():
-        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
-        return
-    tx_id = int(tx_id_str)
-
-    tx = (
-        await db_session.execute(
-            select(Transaction)
-            .options(selectinload(Transaction.user))
-            .where(Transaction.id == tx_id)
-        )
-    ).scalar_one_or_none()
-
-    if not tx or tx.status != "pending":
-        await callback.answer("❌ فیش قبلاً بررسی شده.", show_alert=True)
-        return
-
-    user = tx.user
-    if not user:
-        await callback.answer("❌ کاربر مرتبط با این فیش یافت نشد.", show_alert=True)
-        return
-
-    bot = callback.bot
-    if not bot:
-        await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
-        return
-
-    # ---------------------------------------------------------
-    # 🌟 [سیستم بازگشت وجه - Refund]:
-    # اگر کاربر برای خرید پلن، بخشی از هزینه را از کیف پول داده و سپس فیش را برای بقیه پول ارسال کرده بوده،
-    # پولی که از کیف پولش بلاک (کسر) شده را محاسبه و دوباره به حسابش واریز (Refund) می‌کنیم!
-    # ---------------------------------------------------------
-    if tx.plan_id:
-        # ۱. قیمت واقعی پلن بعد از تخفیف را در می‌آوریم
-        actual_plan_price = int(tx.original_amount) - (
-            int(tx.original_amount) * int(tx.discount_percent or 0) // 100
-        )
-
-        # ۲. مبلغی که باید به کارت واریز می‌شده دقیقاً tx.amount است (بدون کارمزد رندوم)
-        payable_via_card = int(tx.amount)
-
-        # ۳. پس پولی که از کیف پول کاربر بلاک شده بوده دقیقاً اختلاف این دو عدد است:
-        wallet_used = actual_plan_price - payable_via_card
-
-        # ۴. اگر پولی درگیر بوده، دقیقاً همان مقدار را به حسابش برمی‌گردانیم
-        if wallet_used > 0:
-            user.wallet_balance += wallet_used
-    tx.status = "rejected"
-    await db_session.commit()
-
-    if isinstance(callback.message, types.Message):
+    except Exception as e:
+        logger.exception(f"Error in admin_reject_transaction for callback {callback.data}: {e}")
         try:
-            await callback.message.delete()
-        except TelegramBadRequest:
+            await callback.answer("❌ خطای سیستمی در پردازش رد فیش.", show_alert=True)
+        except Exception:
             pass
-
-    if isinstance(callback.message, types.Message):
-        await bot.send_message(
-            chat_id=user.telegram_id,
-            text=(
-                f"❌ <b>پرداخت شما تایید نشد.</b>\n\n"
-                f"فیش ارسالی برای مبلغ <code>{int(tx.amount):,}</code> تومان توسط پشتیبانی رد شد.\n"
-                "در صورتی که مبلغی از کیف پول شما کسر شده بود، به حساب شما بازگردانده شد."
-            ),
-        )
-    await callback.answer()
 
 
 # ==========================================
@@ -908,15 +920,17 @@ async def srv_name(message: types.Message, state: FSMContext):
 
 def _parse_hiddify_admin_link(link: str) -> dict[str, str] | None:
     """Parse Hiddify admin link to extract base_url, admin_proxy_path, api_key.
-    
+
     Expected formats:
     - https://host/<admin_path>/<admin_uuid>/admin/ (may end with /#NAME)
     - https://host/<admin_path>/<admin_uuid>/#NAME (no /admin/ segment)
     Returns dict with keys: base_url, admin_proxy_path, api_key
     Returns None if parsing fails.
+    Finds the FIRST UUID segment in the path; everything before it is admin_proxy_path.
     """
     from urllib.parse import urlparse
-    
+    import uuid
+
     try:
         parsed = urlparse(link.strip())
         if not parsed.scheme or not parsed.netloc:
@@ -930,24 +944,22 @@ def _parse_hiddify_admin_link(link: str) -> dict[str, str] | None:
         if len(parts) < 2:
             return None
 
-        # Determine UUID position:
-        # If last part is 'admin', UUID is second-to-last
-        # Otherwise, UUID is last part
-        if parts[-1] == 'admin':
-            if len(parts) < 3:
-                return None
-            api_key = parts[-2]
-            admin_proxy_path = '/'.join(parts[:-2])
-        else:
-            api_key = parts[-1]
-            admin_proxy_path = '/'.join(parts[:-1])
+        # Find the FIRST UUID segment
+        uuid_index = -1
+        for i, part in enumerate(parts):
+            try:
+                uuid.UUID(part)
+                uuid_index = i
+                break
+            except ValueError:
+                continue
         
-        # Validate UUID format (basic check)
-        import uuid
-        try:
-            uuid.UUID(api_key)
-        except ValueError:
+        if uuid_index == -1 or uuid_index == 0:
+            # No UUID found, or UUID is the first part (no admin path)
             return None
+        
+        api_key = parts[uuid_index]
+        admin_proxy_path = '/'.join(parts[:uuid_index])
 
         if not admin_proxy_path or not api_key:
             return None
@@ -1135,16 +1147,18 @@ async def srv_hiddify_user_sub_link(message: types.Message, state: FSMContext, d
         
         sub_url_template = f"{parsed.scheme}://{parsed.netloc}{path_before_uuid}{{uuid}}/sub64/"
         
-        # Store the template
-        await state.update_data(sub_url_template=sub_url_template)
-        
+        # Store the template in both top-level state and values dict
+        values = data.get("values", {})
+        values["sub_url_template"] = sub_url_template
+        await state.update_data(values=values, sub_url_template=sub_url_template)
+
         # Show confirmation with masked example link
         masked_link = f"{parsed.scheme}://{parsed.netloc}{path_before_uuid}<uuid>/sub64/"
         
         await message.answer(
             f"✅ <b>لینک اشتراک معتبر است.</b>\n\n"
             f"ساختار لینک اشتراک استخراج شد:\n"
-            f"<code>{masked_link}</code>\n\n"
+            f"<code>{html.escape(masked_link)}</code>\n\n"
             f"آیا این ساختار درست است؟"
         )
         
@@ -3553,7 +3567,9 @@ async def admin_customer_service_monitor(
     adapter = get_adapter(server)
     remote_user = None
     try:
-        remote_user = await adapter.get_user(username)
+        # Use stored remote_user_id if available (Hiddify panel UUID), otherwise generate from username
+        remote_id = tx.remote_user_id or adapter.remote_id_for(username)
+        remote_user = await adapter.get_user(remote_id)
     except Exception as e:
         logger.error(f"Admin live monitoring failed for tx {tx_id}: {e}")
         remote_user = None

@@ -131,6 +131,9 @@ class MarzbanAdapter(TokenPanel):
 
     def _to_remote(self, body: dict[str, Any]) -> RemoteUser:
         username = str(body.get("username", ""))
+        hwid_limit = body.get("hwid_limit")
+        if hwid_limit is None:
+            hwid_limit = 0
         return RemoteUser(
             remote_id=username,
             username=username,
@@ -139,4 +142,5 @@ class MarzbanAdapter(TokenPanel):
             used_bytes=int(body.get("used_traffic") or 0),
             data_limit_bytes=int(body.get("data_limit") or 0),
             expire_at=parse_expire(body.get("expire")),
+            hwid_limit=int(hwid_limit),
         )

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT = 5
 TOTAL_TIMEOUT = 20
-USER_AGENT = "V2RayBot/1.0"
+USER_AGENT = "Mozilla/5.0 (compatible; V2RayShop/1.0)"
 
 
 def _extract_message(body: Any, text: str) -> str:
@@ -23,13 +23,18 @@ def _extract_message(body: Any, text: str) -> str:
     msg = ""
     if isinstance(body, dict):
         detail = body.get("detail", body.get("msg", body.get("message")))
-        if isinstance(detail, str):
+        if isinstance(detail, str) and detail:
             msg = detail
         elif isinstance(detail, list) and detail:
             first = detail[0]
             msg = str(first.get("msg", first)) if isinstance(first, dict) else str(first)
-        elif detail is not None:
+        elif detail is not None and not (isinstance(detail, dict) and not detail):
             msg = str(detail)
+        # Fallback to 'message' field if detail is empty dict or not a string
+        if not msg:
+            message_field = body.get("message")
+            if isinstance(message_field, str) and message_field:
+                msg = message_field
     if not msg:
         msg = text
     return msg.strip().replace("\n", " ")[:200]

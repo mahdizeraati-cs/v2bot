@@ -104,6 +104,7 @@ class RemoteUser:
     used_bytes: int
     data_limit_bytes: int  # 0 = نامحدود
     expire_at: datetime | None  # None = نامحدود
+    hwid_limit: int = 0  # 0 = نامحدود/بدون محدودیت
 
 
 class PanelAdapter(Protocol):
