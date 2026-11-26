@@ -20,6 +20,10 @@ from sqlalchemy.orm import selectinload
 from bot.config import BUTTONS, MESSAGES
 from bot.states import PurchaseStates, UserStates, WalletChargeStates
 from core.database.crud import get_or_create_user, get_name, set_name, NameTaken
+from core.database.crud import (
+    is_partner,
+    get_partner,
+)
 from core.database.models import (
     DiscountCode,
     ForceJoinChannel,
@@ -82,34 +86,44 @@ async def cmd_start(message: types.Message, db_session: AsyncSession) -> None:
     wallet_balance = int(db_user.wallet_balance)
     welcome_text = MESSAGES["welcome"].format(name=first_name, balance=wallet_balance)
 
-    main_menu_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=BUTTONS["buy_new_service"], callback_data="buy_new_service"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=BUTTONS["my_services"], callback_data="my_services"
-                ),
-                InlineKeyboardButton(
-                    text=BUTTONS["charge_wallet"], callback_data="charge_wallet"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=BUTTONS["user_profile"], callback_data="user_profile"
-                ),
-                InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=BUTTONS["free_test"], callback_data="free_test_start"
-                )
-            ],
-        ]
-    )
+    # Check if user is an active partner
+    partner_active = await is_partner(db_session, user_id)
+
+    keyboard_rows = [
+        [
+            InlineKeyboardButton(
+                text=BUTTONS["buy_new_service"], callback_data="buy_new_service"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=BUTTONS["my_services"], callback_data="my_services"
+            ),
+            InlineKeyboardButton(
+                text=BUTTONS["charge_wallet"], callback_data="charge_wallet"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=BUTTONS["user_profile"], callback_data="user_profile"
+            ),
+            InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=BUTTONS["free_test"], callback_data="free_test_start"
+            )
+        ],
+    ]
+    
+    if partner_active:
+        keyboard_rows.insert(1, [
+            InlineKeyboardButton(
+                text=BUTTONS["partner_purchases"], callback_data="partner_buy_service"
+            )
+        ])
+
+    main_menu_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
     await message.answer(text=welcome_text, reply_markup=main_menu_keyboard)
 
 
@@ -134,34 +148,44 @@ async def process_back_to_main(
 
     welcome_text = MESSAGES["welcome"].format(name=first_name, balance=wallet_balance)
 
-    main_menu_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=BUTTONS["buy_new_service"], callback_data="buy_new_service"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=BUTTONS["my_services"], callback_data="my_services"
-                ),
-                InlineKeyboardButton(
-                    text=BUTTONS["charge_wallet"], callback_data="charge_wallet"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=BUTTONS["user_profile"], callback_data="user_profile"
-                ),
-                InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=BUTTONS["free_test"], callback_data="free_test_start"
-                )
-            ],
-        ]
-    )
+    # Check if user is an active partner
+    partner_active = await is_partner(db_session, callback.from_user.id)
+
+    keyboard_rows = [
+        [
+            InlineKeyboardButton(
+                text=BUTTONS["buy_new_service"], callback_data="buy_new_service"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=BUTTONS["my_services"], callback_data="my_services"
+            ),
+            InlineKeyboardButton(
+                text=BUTTONS["charge_wallet"], callback_data="charge_wallet"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=BUTTONS["user_profile"], callback_data="user_profile"
+            ),
+            InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=BUTTONS["free_test"], callback_data="free_test_start"
+            )
+        ],
+    ]
+    
+    if partner_active:
+        keyboard_rows.insert(1, [
+            InlineKeyboardButton(
+                text=BUTTONS["partner_purchases"], callback_data="partner_buy_service"
+            )
+        ])
+
+    main_menu_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(
@@ -236,6 +260,78 @@ async def process_buy_new_service(
     await callback.answer()
 
 
+# --- Partner buy service: show servers with partner pricing ---
+@router.callback_query(F.data == "partner_buy_service")
+async def process_partner_buy_service(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
+    if not callback.from_user:
+        return
+
+    stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+    user = (await db_session.execute(stmt_user)).scalar_one_or_none()
+
+    if not user:
+        await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
+        return
+
+    # Verify user is an active partner
+    partner = await get_partner(db_session, callback.from_user.id)
+    if not partner or not partner.is_active:
+        await callback.answer("❌ شما به عنوان همکار فعال نیستید.", show_alert=True)
+        return
+
+    shared_subq = select(VendorServer.server_id).where(
+        VendorServer.vendor_id == user.vendor_id
+    )
+    stmt_servers = (
+        select(Server)
+        .join(Plan, Plan.server_id == Server.id)
+        .where(
+            Plan.is_active == True,
+            Plan.is_deleted == False,
+            Server.is_active == True,
+            Server.is_deleted == False,
+            or_(
+                Server.vendor_id == user.vendor_id,
+                Server.id.in_(shared_subq),
+            ),
+        )
+        .distinct()
+    )
+    servers = (await db_session.execute(stmt_servers)).scalars().all()
+
+    if not servers:
+        if isinstance(callback.message, types.Message):
+            await callback.message.edit_text(
+                "❌ فروشگاه شما هنوز هیچ سرویسی تعریف نکرده است.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="🔙 بازگشت", callback_data="back_to_main"
+                            )
+                        ]
+                    ]
+                ),
+            )
+        await callback.answer()
+        return
+
+    builder = InlineKeyboardBuilder()
+    for srv in servers:
+        builder.button(text=f"🌍 سرور: {srv.name}", callback_data=f"partner_sel_srv_{srv.id}")
+
+    builder.button(text="🔙 بازگشت به منوی اصلی", callback_data="back_to_main")
+    builder.adjust(1)
+
+    if isinstance(callback.message, types.Message):
+        text = "🤝 <b>خرید اشتراک با تخفیف همکار</b>\n\nلطفاً یک سرور (موقعیت) را انتخاب کنید:"
+        await callback.message.edit_text(text=text, reply_markup=builder.as_markup())
+
+    await callback.answer()
+
+
 # --- ۴. نمایش پلن‌های یک سرور خاص ---
 @router.callback_query(F.data.startswith("sel_srv_"))
 async def process_server_selection(
@@ -287,6 +383,71 @@ async def process_server_selection(
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(
             text=f"📁 <b>سرویس‌های {server_name}</b>\n\nپلن مورد نظر خود را انتخاب کنید:",
+            reply_markup=builder.as_markup(),
+        )
+    await callback.answer()
+
+
+# --- Partner: show plans with partner pricing ---
+@router.callback_query(F.data.startswith("partner_sel_srv_"))
+async def process_partner_server_selection(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
+    if not callback.data or not callback.from_user:
+        return
+    srv_id_str = callback.data.replace("partner_sel_srv_", "")
+    if not srv_id_str.isdigit():
+        return
+    srv_id = int(srv_id_str)
+
+    stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+    user = (await db_session.execute(stmt_user)).scalar_one_or_none()
+    if not user:
+        return
+
+    # Verify user is an active partner
+    partner = await get_partner(db_session, callback.from_user.id)
+    if not partner or not partner.is_active:
+        await callback.answer("❌ شما به عنوان همکار فعال نیستید.", show_alert=True)
+        return
+
+    shared_subq = select(VendorServer.server_id).where(
+        VendorServer.vendor_id == user.vendor_id
+    )
+    stmt_plans = (
+        select(Plan)
+        .options(selectinload(Plan.server))
+        .join(Server, Server.id == Plan.server_id)
+        .where(
+            Plan.server_id == srv_id,
+            Plan.is_active == True,
+            Plan.is_deleted == False,
+            Server.is_active == True,
+            Server.is_deleted == False,
+            or_(
+                Server.vendor_id == user.vendor_id,
+                Server.id.in_(shared_subq),
+            ),
+        )
+    )
+    plans = (await db_session.execute(stmt_plans)).scalars().all()
+
+    builder = InlineKeyboardBuilder()
+    server_name = plans[0].server.name if plans else "نامشخص"
+
+    for plan in plans:
+        # Calculate partner price
+        from core.utils.partner_utils import discounted_price
+        partner_price = discounted_price(int(plan.price), partner.discount_percent)
+        btn_text = f"🪫 {plan.title} - {partner_price:,} تومان (تخفیف {partner.discount_percent}%)"
+        builder.button(text=btn_text, callback_data=f"partner_buy_plan_{plan.id}")
+
+    builder.button(text="🔙 بازگشت به لیست سرورها", callback_data="partner_buy_service")
+    builder.adjust(1)
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            text=f"🤝 <b>سرویس‌های {server_name} (با تخفیف همکار {partner.discount_percent}%)</b>\n\nپلن مورد نظر خود را انتخاب کنید:",
             reply_markup=builder.as_markup(),
         )
     await callback.answer()
@@ -379,6 +540,112 @@ async def process_plan_selection(
 
     builder.button(
         text="🔙 بازگشت به سرویس‌ها", callback_data=f"sel_srv_{plan.server_id}"
+    )
+    builder.adjust(1)
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(text=text, reply_markup=builder.as_markup())
+
+    await callback.answer()
+
+
+# --- Partner: show plan details with partner pricing and wallet-only purchase ---
+@router.callback_query(F.data.startswith("partner_buy_plan_"))
+async def process_partner_plan_selection(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+) -> None:
+    if not callback.data or not callback.from_user:
+        return
+
+    plan_id_str = callback.data.replace("partner_buy_plan_", "")
+    if not plan_id_str.isdigit():
+        return
+    plan_id = int(plan_id_str)
+
+    stmt_plan = (
+        select(Plan).options(selectinload(Plan.server)).where(Plan.id == plan_id)
+    )
+    plan = (await db_session.execute(stmt_plan)).scalar_one_or_none()
+
+    if not plan:
+        await callback.answer("❌ پلن مورد نظر یافت نشد.", show_alert=True)
+        return
+
+    stmt_user = (
+        select(User, Vendor)
+        .join(Vendor, User.vendor_id == Vendor.id)
+        .where(User.telegram_id == callback.from_user.id)
+    )
+    row = (await db_session.execute(stmt_user)).first()
+    if not row:
+        return
+    user, vendor = row
+
+    # Verify user is an active partner
+    partner = await get_partner(db_session, callback.from_user.id)
+    if not partner or not partner.is_active:
+        await callback.answer("❌ شما به عنوان همکار فعال نیستید.", show_alert=True)
+        return
+
+    wallet_balance = int(user.wallet_balance)
+
+    target_vendor = vendor
+    if vendor.redirect_target_id:
+        stmt_target = select(Vendor).where(Vendor.id == vendor.redirect_target_id)
+        redirected_vendor = (await db_session.execute(stmt_target)).scalar_one_or_none()
+        if redirected_vendor:
+            target_vendor = redirected_vendor
+
+    is_card_missing = not target_vendor.card_number
+
+    vol_text = "نامحدود ∞" if plan.volume_gb == 0 else f"{plan.volume_gb} گیگابایت"
+    days_text = "نامحدود ∞" if plan.days == 0 else f"{plan.days} روز"
+    user_limit_text = (
+        "نامحدود ∞" if plan.user_limit == 0 else f"{plan.user_limit} کاربر"
+    )
+    desc_text = plan.description if plan.description else "ندارد"
+
+    # Calculate partner price
+    from core.utils.partner_utils import discounted_price
+    original_price = int(plan.price)
+    final_price = discounted_price(original_price, partner.discount_percent)
+
+    plan_details = (
+        f"🛍 <b>پلن:</b> {plan.title}\n"
+        f"🖥 <b>سرور:</b> {plan.server.name}\n"
+        f"💽 <b>حجم:</b> {vol_text}\n"
+        f"⏳ <b>اعتبار:</b> {days_text}\n"
+        f"👥 <b>کاربر همزمان:</b> {user_limit_text}\n"
+        f"📝 <b>توضیحات:</b> {desc_text}\n"
+        f"💵 <b>قیمت اصلی:</b> {original_price:,} تومان\n"
+        f"🤝 <b>قیمت با تخفیف همکار ({partner.discount_percent}%):</b> {final_price:,} تومان\n"
+        "〰️〰️〰️〰️〰️〰️〰️\n"
+        f"💰 <b>موجودی شما:</b> {wallet_balance:,} تومان\n\n"
+    )
+
+    builder = InlineKeyboardBuilder()
+
+    if is_card_missing and wallet_balance < final_price:
+        text = (
+            "❌ <b>شماره کارت فروشگاه ثبت نشده است!</b>\n\n"
+            + plan_details
+            + "لطفاً پیش از اقدام به خرید، با پشتیبانی هماهنگ کنید."
+        )
+    else:
+        if wallet_balance >= final_price:
+            builder.button(
+                text=f"✅ خرید مستقیم از کیف پول ({final_price:,} تومان)",
+                callback_data=f"partner_wallet_buy_{plan.id}",
+            )
+        else:
+            builder.button(
+                text="💳 شارژ کیف پول", callback_data="charge_wallet"
+            )
+
+        text = "🤝 <b>خرید با تخفیف همکار</b>\n\n" + plan_details + "لطفاً یک گزینه را انتخاب کنید:"
+
+    builder.button(
+        text="🔙 بازگشت به سرویس‌ها", callback_data=f"partner_sel_srv_{plan.server_id}"
     )
     builder.adjust(1)
 
@@ -1039,6 +1306,218 @@ async def process_wallet_buy(
                 [InlineKeyboardButton(text=BUTTONS["free_test"], callback_data="free_test_start")],
             ]
         )
+        await callback.bot.send_message(
+            chat_id=user.telegram_id,
+            text=welcome_text,
+            reply_markup=main_menu_keyboard
+        )
+
+
+# --- Partner wallet buy: handle wallet purchase with partner pricing ---
+@router.callback_query(F.data.startswith("partner_wallet_buy_"))
+async def process_partner_wallet_buy(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+) -> None:
+    if not callback.data or not callback.from_user:
+        return
+
+    plan_id_str = callback.data.replace("partner_wallet_buy_", "")
+    if not plan_id_str.isdigit():
+        return
+    plan_id = int(plan_id_str)
+
+    user = (
+        await db_session.execute(
+            select(User).where(User.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    plan = (
+        await db_session.execute(
+            select(Plan).options(selectinload(Plan.server)).where(Plan.id == plan_id)
+        )
+    ).scalar_one_or_none()
+
+    if not user or not plan:
+        await callback.answer("❌ خطایی رخ داد.", show_alert=True)
+        return
+
+    # Verify user is an active partner
+    partner = await get_partner(db_session, callback.from_user.id)
+    if not partner or not partner.is_active:
+        await callback.answer("❌ شما به عنوان همکار فعال نیستید.", show_alert=True)
+        return
+
+    original_price = int(plan.price)
+    final_price = discounted_price(original_price, partner.discount_percent)
+
+    # Check if user has a chosen name
+    has_name = await _check_and_ask_name(state, db_session, user.id)
+    if not has_name:
+        await _ask_for_name(callback, state)
+        return
+
+    if user.wallet_balance < final_price:
+        await callback.answer(
+            "❌ موجودی کیف پول شما تغییر کرده و کافی نیست!", show_alert=True
+        )
+        return
+
+    user.wallet_balance -= final_price
+
+    # Get chosen name for panel username
+    chosen_name = await get_name(db_session, user.id)
+    normalized_name = normalize_name(chosen_name) if chosen_name else None
+
+    new_tx = Transaction(
+        user_id=user.id,
+        vendor_id=plan.vendor_id,
+        plan_id=plan.id,
+        amount=0,
+        original_amount=original_price,
+        discount_percent=partner.discount_percent,
+        discount_code_id=None,
+        status="approved",
+        list_price=original_price,
+        final_price=final_price,
+    )
+    db_session.add(new_tx)
+    await db_session.commit()
+    await db_session.refresh(new_tx)
+
+    # Build panel username using chosen name if available, else legacy format
+    if normalized_name:
+        username = build_panel_username_with_fallback(
+            normalized_name, new_tx.id, user.telegram_id, int(new_tx.created_at.timestamp())
+        )
+    else:
+        username = legacy_panel_username(user.telegram_id, new_tx.id, new_tx.created_at)
+    
+    # Store panel_username on transaction
+    new_tx.panel_username = username
+    await db_session.flush()
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text("⏳ در حال ارتباط با سرور و ساخت کانفیگ...")
+
+    server = plan.server
+    data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
+    duration_days = plan.days if plan.days > 0 else 0
+    hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
+
+    spec = UserSpec(
+        username=username,
+        data_limit_bytes=data_limit_bytes,
+        duration_days=duration_days,
+        note="",
+        hwid_limit=hwid_limit,
+    )
+
+    adapter = get_adapter(server)
+    sub_url = ""
+    try:
+        remote_user = await adapter.create_user(spec)
+        sub_url = remote_user.subscription_url
+        # Store the actual panel UUID for Hiddify (panel may generate its own UUID)
+        new_tx.remote_user_id = remote_user.remote_id
+        new_tx.status = "approved"
+        await db_session.flush()
+    except PanelError as e:
+        logger.error(f"Config creation via Partner Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
+    except Exception as e:
+        logger.error(f"Config creation via Partner Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
+    finally:
+        await adapter.aclose()
+
+    if sub_url:
+        caption = (
+            f"\u2705 <b>خرید شما با موفقیت انجام شد!</b>\n\n"
+            f"\u062eوش با تخیف همکار: {partner.discount_percent}%\n"
+            f"\ud83c\udf7d پلن: {plan.title}\n"
+            f"\ud83d\udda5 سرور: {server.name}\n\n"
+            f"\ud83d\udd17 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
+        )
+        try:
+            import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
+
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=_qr_constants.ERROR_CORRECT_M,
+                box_size=10,
+                border=4,
+            )  # type: ignore[call-overload]
+            qr.add_data(sub_url)
+            qr.make(fit=True)
+            qr_image = qr.make_image(fill_color="black", back_color="white")
+            stream = io.BytesIO()
+            qr_image.save(stream, "PNG")  # type: ignore[call-arg]
+            stream.seek(0)
+            qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
+            if isinstance(callback.message, types.Message):
+                await callback.message.delete()
+            if callback.bot is not None:
+                await callback.bot.send_photo(
+                    chat_id=user.telegram_id,
+                    photo=qr_file,
+                    caption=caption,
+                )
+        except Exception:
+            if isinstance(callback.message, types.Message):
+                await callback.message.edit_text(caption)
+    else:
+        user.wallet_balance += final_price
+        new_tx.status = "failed"
+        await db_session.commit()
+        if isinstance(callback.message, types.Message):
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+
+        if callback.bot is not None:
+            await callback.bot.send_message(
+                chat_id=user.telegram_id,
+                text="❌ متاسفانه در ارتباط با سرور مشکل پیش آمد. مبلغ به طور کامل به قیمت پول شما برگرگشت شد."
+            )
+    if callback.bot is not None:
+        wallet_balance = int(user.wallet_balance)
+        first_name = callback.from_user.first_name if callback.from_user else MESSAGES.get("default_user", "کاربر")
+        welcome_text = MESSAGES["welcome"].format(name=first_name, balance=wallet_balance)
+
+        # Rebuild keyboard with partner button if still active
+        partner_active = await is_partner(db_session, user.telegram_id)
+        keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["buy_new_service"], callback_data="buy_new_service"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["my_services"], callback_data="my_services"
+                ),
+                InlineKeyboardButton(
+                    text=BUTTONS["charge_wallet"], callback_data="charge_wallet"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["user_profile"], callback_data="user_profile"
+                ),
+                InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["free_test"], callback_data="free_test_start"
+                )
+            ],
+        ]
+        if partner_active:
+            keyboard_rows.insert(1, [
+                InlineKeyboardButton(
+                    text=BUTTONS["partner_purchases"], callback_data="partner_buy_service"
+                )
+            ])
+        main_menu_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         await callback.bot.send_message(
             chat_id=user.telegram_id,
             text=welcome_text,

@@ -39,13 +39,24 @@ from core.database.models import (
     User,
     Vendor,
     VendorServer,
+    Partner,
+    PartnerAudit,
 )
 from core.panels import UserSpec, get_adapter, adapter_from_fields, server_kwargs_from_fields
 from core.panels.base import PanelError, PanelRejected, PanelUnreachable, PanelType, PANEL_TYPE_LABELS_FA, error_message_fa
-from core.database.crud import create_server, get_name
+from core.database.crud import (
+    create_server,
+    get_name,
+    is_partner,
+    get_partner,
+    promote_partner,
+    update_partner_terms,
+    revoke_partner,
+)
 from core.utils.username_utils import build_panel_username, legacy_panel_username, normalize_name
 from core.services.panel_client import MarzbanClient  # noqa: F401
 from bot.keyboards import get_panel_type_keyboard, get_confirm_server_keyboard
+from bot.config import MESSAGES
 
 logger = logging.getLogger(__name__)
 
@@ -3290,31 +3301,77 @@ async def admin_customer_detail(
         await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
 
+    # Check if customer is a partner
+    partner = await get_partner(db_session, user.telegram_id)
+    is_partner_active = partner is not None and partner.is_active
+
     text = (
         "👤 <b>جزئیات مشتری</b>\n\n"
         f"🆔 شناسه تلگرام: <code>{user.telegram_id}</code>\n"
         f"📅 تاریخ عضویت: {user.created_at.strftime('%Y-%m-%d')}\n"
         f"💰 موجودی کیف پول: <code>{int(user.wallet_balance):,}</code> تومان"
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💰 شارژ دستی کیف پول", callback_data=f"adm_cust_chg_{user.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗂 سرویسهای مشتری", callback_data=f"adm_cust_srv_{user.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔙 بازگشت به لیست", callback_data="adm_cust_list_1"
-                )
-            ],
+    
+    if is_partner_active:
+        text += f"\n\n🤝 <b>وضعیت همکار:</b> فعال\n"
+        text += f"📊 <b>حداقل شارژ:</b> {partner.min_topup_toman:,} تومان\n"
+        text += f"🎁 <b>تخفیف:</b> {partner.discount_percent}%"
+    else:
+        text += "\n\n🤝 <b>وضعیت همکار:</b> غیرفعال"
+
+    kb_rows = []
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                text="💰 شارژ دستی کیف پول", callback_data=f"adm_cust_chg_{user.id}"
+            )
         ]
     )
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                text="🗂 سرویسهای مشتری", callback_data=f"adm_cust_srv_{user.id}"
+            )
+        ]
+    )
+    if is_partner_active:
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="✏️ ویرایش شرایط همکار", callback_data=f"adm_cust_edit_partner_{user.id}"
+                )
+            ]
+        )
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔍 مشاهده شرایط همکار", callback_data=f"adm_cust_view_partner_{user.id}"
+                )
+            ]
+        )
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="❌ لغو همکاری", callback_data=f"adm_cust_revoke_partner_{user.id}"
+                )
+            ]
+        )
+    else:
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⬆️ ارتقا به همکار", callback_data=f"adm_cust_promote_partner_{user.id}"
+                )
+            ]
+        )
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 بازگشت به لیست", callback_data="adm_cust_list_1"
+            )
+        ]
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     if isinstance(callback.message, types.Message):
         try:
             await callback.message.edit_text(text, reply_markup=kb)
@@ -4258,3 +4315,548 @@ async def process_partner_name(
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
     if text:
         await message.answer(text, reply_markup=reply_markup)
+
+# ==================== Partner Management from Customer Detail ====================
+
+@router.callback_query(F.data.startswith("adm_cust_promote_partner_"))
+async def admin_promote_partner_start(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    user_id_str = callback.data.replace("adm_cust_promote_partner_", "")
+    if not user_id_str.isdigit():
+        await callback.answer("Invalid ID.", show_alert=True)
+        return
+    user_id = int(user_id_str)
+
+    admin_vendor = (
+        await db_session.execute(
+            select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("Vendor not found.", show_alert=True)
+        return
+
+    target_user = (
+        await db_session.execute(select(User).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if not target_user:
+        await callback.answer("User not found.", show_alert=True)
+        return
+
+    if target_user.vendor_id != admin_vendor.id:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+
+    existing_partner = await get_partner(db_session, target_user.telegram_id)
+    if existing_partner and existing_partner.is_active:
+        await callback.answer("Already an active partner.", show_alert=True)
+        return
+
+    await state.update_data(target_user_id=user_id, target_telegram_id=target_user.telegram_id)
+    await state.set_state(AdminPartnerStates.waiting_for_min_topup)
+
+    text = f"Promote user {target_user.telegram_id} to partner.\nEnter minimum top-up (Toman):"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Cancel", callback_data=f"adm_cust_det_{user_id}")]
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.message(AdminPartnerStates.waiting_for_min_topup)
+async def admin_promote_partner_min_topup(
+    message: types.Message, state: FSMContext, db_session: AsyncSession
+):
+    if not message.text or not message.from_user:
+        return
+
+    try:
+        min_topup = int(message.text.strip())
+        if min_topup <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Amount must be positive. Try again:")
+        return
+
+    await state.update_data(min_topup_toman=min_topup)
+    await state.set_state(AdminPartnerStates.waiting_for_discount_percent)
+
+    text = f"Min top-up: {min_topup:,} Toman.\nNow enter discount percent (1-90):"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Cancel", callback_data="admin_my_customers")]
+        ]
+    )
+    await message.answer(text, reply_markup=kb)
+
+
+@router.message(AdminPartnerStates.waiting_for_discount_percent)
+async def admin_promote_partner_discount_percent(
+    message: types.Message, state: FSMContext, db_session: AsyncSession
+):
+    if not message.text or not message.from_user:
+        return
+
+    data = await state.get_data()
+    is_edit = "new_min_topup" in data
+
+    try:
+        discount = int(message.text.strip())
+        if discount < 1 or discount > 90:
+            raise ValueError
+    except ValueError:
+        await message.answer("Discount must be 1-90. Try again:")
+        return
+
+    if is_edit:
+        await state.update_data(new_discount_percent=discount)
+        min_topup = data.get("new_min_topup")
+        target_telegram_id = data.get("target_telegram_id")
+        target_user_id = data.get("target_user_id")
+
+        await state.set_state(AdminPartnerStates.waiting_for_confirm_edit)
+
+        text = f"Confirm edit: min_topup={min_topup:,}, discount={discount}% for user {target_telegram_id}. Confirm?"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Confirm Edit", callback_data="adm_cust_confirm_edit")],
+                [InlineKeyboardButton(text="Cancel", callback_data="admin_my_customers")]
+            ]
+        )
+        await message.answer(text, reply_markup=kb)
+    else:
+        # Promote flow
+        await state.update_data(discount_percent=discount)
+        await state.set_state(AdminPartnerStates.waiting_for_confirm_promote)
+
+        min_topup = data.get("min_topup_toman")
+        target_telegram_id = data.get("target_telegram_id")
+
+        text = f"Confirm promote: min_topup={min_topup:,}, discount={discount}% for user {target_telegram_id}. Confirm?"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Confirm Promote", callback_data="adm_cust_confirm_promote")],
+                [InlineKeyboardButton(text="Cancel", callback_data="admin_my_customers")]
+            ]
+        )
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "adm_cust_confirm_promote")
+async def admin_promote_partner_confirm(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    target_user_id = data.get("target_user_id")
+    target_telegram_id = data.get("target_telegram_id")
+    min_topup = data.get("min_topup_toman")
+    discount = data.get("discount_percent")
+
+    if not all([target_user_id, target_telegram_id, min_topup, discount]):
+        await callback.answer("Missing data.", show_alert=True)
+        await state.clear()
+        return
+
+    # Re-fetch and re-validate admin vendor and target customer
+    admin_vendor = (
+        await db_session.execute(
+            select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("Vendor not found.", show_alert=True)
+        await state.clear()
+        return
+
+    target_user = (
+        await db_session.execute(select(User).where(User.id == target_user_id))
+    ).scalar_one_or_none()
+    if not target_user:
+        await callback.answer("User not found.", show_alert=True)
+        await state.clear()
+        return
+
+    if target_user.vendor_id != admin_vendor.id:
+        await callback.answer("Access denied.", show_alert=True)
+        await state.clear()
+        return
+
+    # Verify target_telegram_id matches
+    if target_user.telegram_id != target_telegram_id:
+        await callback.answer("Invalid customer data.", show_alert=True)
+        await state.clear()
+        return
+
+    try:
+        partner = await promote_partner(
+            session=db_session,
+            customer_telegram_id=target_telegram_id,
+            admin_telegram_id=callback.from_user.id,
+            min_topup_toman=min_topup,
+            discount_percent=discount,
+        )
+    except ValueError as e:
+        await callback.answer(f"Error: {e}", show_alert=True)
+        await state.clear()
+        return
+
+    await state.clear()
+
+    # Send notification to partner
+    try:
+        if callback.bot:
+            await callback.bot.send_message(
+                chat_id=target_telegram_id,
+                text=MESSAGES["partner_notification"]
+            )
+    except Exception:
+        pass
+
+    text = f"Partner promoted: user {target_telegram_id}, min_topup={min_topup:,}, discount={discount}%"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Back to Details", callback_data=f"adm_cust_det_{target_user_id}")]
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_cust_edit_partner_"))
+async def admin_edit_partner_start(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    user_id_str = callback.data.replace("adm_cust_edit_partner_", "")
+    if not user_id_str.isdigit():
+        await callback.answer("Invalid ID.", show_alert=True)
+        return
+    user_id = int(user_id_str)
+
+    admin_vendor = (
+        await db_session.execute(
+            select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("Vendor not found.", show_alert=True)
+        return
+
+    target_user = (
+        await db_session.execute(select(User).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if not target_user:
+        await callback.answer("User not found.", show_alert=True)
+        return
+
+    if target_user.vendor_id != admin_vendor.id:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+
+    partner = await get_partner(db_session, target_user.telegram_id)
+    if not partner or not partner.is_active:
+        await callback.answer("Not an active partner.", show_alert=True)
+        return
+
+    await state.update_data(target_user_id=user_id, target_telegram_id=target_user.telegram_id, new_min_topup=partner.min_topup_toman)
+    await state.set_state(AdminPartnerStates.waiting_for_confirm_edit)
+
+    text = f"Edit partner {target_user.telegram_id}. Current: min_topup={partner.min_topup_toman:,}, discount={partner.discount_percent}%. Enter new min_topup:"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Cancel", callback_data=f"adm_cust_det_{user_id}")]
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm_cust_confirm_edit")
+async def admin_edit_partner_confirm(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    target_user_id = data.get("target_user_id")
+    target_telegram_id = data.get("target_telegram_id")
+    min_topup = data.get("new_min_topup")
+    discount = data.get("new_discount_percent")
+
+    if not all([target_user_id, target_telegram_id, min_topup, discount]):
+        await callback.answer("Missing data.", show_alert=True)
+        await state.clear()
+        return
+
+    # Re-fetch and re-validate admin vendor and target customer
+    admin_vendor = (
+        await db_session.execute(
+            select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("Vendor not found.", show_alert=True)
+        await state.clear()
+        return
+
+    target_user = (
+        await db_session.execute(select(User).where(User.id == target_user_id))
+    ).scalar_one_or_none()
+    if not target_user:
+        await callback.answer("User not found.", show_alert=True)
+        await state.clear()
+        return
+
+    if target_user.vendor_id != admin_vendor.id:
+        await callback.answer("Access denied.", show_alert=True)
+        await state.clear()
+        return
+
+    # Verify target_telegram_id matches
+    if target_user.telegram_id != target_telegram_id:
+        await callback.answer("Invalid customer data.", show_alert=True)
+        await state.clear()
+        return
+
+    try:
+        partner = await update_partner_terms(
+            session=db_session,
+            partner_telegram_id=target_telegram_id,
+            admin_telegram_id=callback.from_user.id,
+            min_topup_toman=min_topup,
+            discount_percent=discount,
+        )
+    except ValueError as e:
+        await callback.answer(f"Error: {e}", show_alert=True)
+        await state.clear()
+        return
+
+    await state.clear()
+
+    text = f"Partner updated: user {target_telegram_id}, min_topup={min_topup:,}, discount={discount}%"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Back to Details", callback_data=f"adm_cust_det_{target_user_id}")]
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_cust_revoke_partner_"))
+async def admin_revoke_partner_start(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    user_id_str = callback.data.replace("adm_cust_revoke_partner_", "")
+    if not user_id_str.isdigit():
+        await callback.answer("Invalid ID.", show_alert=True)
+        return
+    user_id = int(user_id_str)
+
+    admin_vendor = (
+        await db_session.execute(
+            select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("Vendor not found.", show_alert=True)
+        return
+
+    target_user = (
+        await db_session.execute(select(User).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if not target_user:
+        await callback.answer("User not found.", show_alert=True)
+        return
+
+    if target_user.vendor_id != admin_vendor.id:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+
+    partner = await get_partner(db_session, target_user.telegram_id)
+    if not partner or not partner.is_active:
+        await callback.answer("Not an active partner.", show_alert=True)
+        return
+
+    await state.update_data(target_user_id=user_id, target_telegram_id=target_user.telegram_id)
+    await state.set_state(AdminPartnerStates.waiting_for_confirm_revoke)
+
+    text = f"Revoke partner {target_user.telegram_id}? Current: min_topup={partner.min_topup_toman:,}, discount={partner.discount_percent}%"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Yes, Revoke", callback_data="adm_cust_confirm_revoke")],
+            [InlineKeyboardButton(text="Cancel", callback_data=f"adm_cust_det_{user_id}")]
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm_cust_confirm_revoke")
+async def admin_revoke_partner_confirm(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    target_user_id = data.get("target_user_id")
+    target_telegram_id = data.get("target_telegram_id")
+
+    if not target_user_id or not target_telegram_id:
+        await callback.answer("Missing data.", show_alert=True)
+        await state.clear()
+        return
+
+    # Re-fetch and re-validate admin vendor and target customer
+    admin_vendor = (
+        await db_session.execute(
+            select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("Vendor not found.", show_alert=True)
+        await state.clear()
+        return
+
+    target_user = (
+        await db_session.execute(select(User).where(User.id == target_user_id))
+    ).scalar_one_or_none()
+    if not target_user:
+        await callback.answer("User not found.", show_alert=True)
+        await state.clear()
+        return
+
+    if target_user.vendor_id != admin_vendor.id:
+        await callback.answer("Access denied.", show_alert=True)
+        await state.clear()
+        return
+
+    # Verify target_telegram_id matches
+    if target_user.telegram_id != target_telegram_id:
+        await callback.answer("Invalid customer data.", show_alert=True)
+        await state.clear()
+        return
+
+    try:
+        partner = await revoke_partner(
+            session=db_session,
+            partner_telegram_id=target_telegram_id,
+            admin_telegram_id=callback.from_user.id,
+        )
+    except ValueError as e:
+        await callback.answer(f"Error: {e}", show_alert=True)
+        await state.clear()
+        return
+
+    await state.clear()
+
+    text = f"Partner revoked: user {target_telegram_id}"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Back to Details", callback_data=f"adm_cust_det_{target_user_id}")]
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_cust_view_partner_"))
+async def admin_view_partner_terms(
+    callback: types.CallbackQuery, db_session: AsyncSession
+):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    user_id_str = callback.data.replace("adm_cust_view_partner_", "")
+    if not user_id_str.isdigit():
+        await callback.answer("Invalid ID.", show_alert=True)
+        return
+    user_id = int(user_id_str)
+
+    admin_vendor = (
+        await db_session.execute(
+            select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("Vendor not found.", show_alert=True)
+        return
+
+    target_user = (
+        await db_session.execute(select(User).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if not target_user:
+        await callback.answer("User not found.", show_alert=True)
+        return
+
+    if target_user.vendor_id != admin_vendor.id:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+
+    partner = await get_partner(db_session, target_user.telegram_id)
+    if not partner or not partner.is_active:
+        await callback.answer("Not an active partner.", show_alert=True)
+        return
+
+    text = f"Partner {target_user.telegram_id}: min_topup={partner.min_topup_toman:,}, discount={partner.discount_percent}%, created={partner.created_at.strftime('%Y-%m-%d')}, added_by={partner.added_by}"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Back to Details", callback_data=f"adm_cust_det_{user_id}")]
+        ]
+    )
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+# ==================== Partner Management from Customer Detail ====================

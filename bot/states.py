@@ -69,6 +69,7 @@ class AdminDiscountStates(StatesGroup):
 
 
 # 🌟 [جدید] وضعیتهای تنظیمات ریدایرکت فروشنده و مدیریت شرکا
+# ⭐ [新] 状态管理资管配详管理资服商和会员管理
 class AdminRedirectStates(StatesGroup):
     waiting_for_redirect_target_id = State()
 
@@ -76,3 +77,9 @@ class AdminRedirectStates(StatesGroup):
 class AdminPartnerStates(StatesGroup):
     waiting_for_partner_telegram_id = State()
     waiting_for_partner_name = State()
+    # Partner management from customer detail
+    waiting_for_min_topup = State()
+    waiting_for_discount_percent = State()
+    waiting_for_confirm_promote = State()
+    waiting_for_confirm_edit = State()
+    waiting_for_confirm_revoke = State()
