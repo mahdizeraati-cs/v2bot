@@ -128,6 +128,9 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # 🌟 [جدید] آیا کاربر قبلاً کانفیگ تست رایگان دریافت کرده است؟ (هر کاربر فقط یک بار)
     has_received_test: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 🌟 [Task 04] User-chosen name for panel usernames
+    chosen_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    normalized_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
     vendor = relationship("Vendor", back_populates="users")
     transactions = relationship("Transaction", back_populates="user")
 
@@ -168,6 +171,8 @@ class Transaction(Base):
     destination_card: Mapped[str] = mapped_column(String(100), nullable=True)
     # 🌟 [جدید] UUID کاربر در پنل (برای هیدیفای و سایر پنل‌هایی که UUID خود تولید می‌کنند)
     remote_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 🌟 [جدید] نام کاربری نهایی در پنل (برایurchase‌های جدید با نام انتخابی)
+    panel_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     user = relationship("User", back_populates="transactions")

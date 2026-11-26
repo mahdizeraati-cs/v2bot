@@ -42,7 +42,8 @@ from core.database.models import (
 )
 from core.panels import UserSpec, get_adapter, adapter_from_fields, server_kwargs_from_fields
 from core.panels.base import PanelError, PanelRejected, PanelUnreachable, PanelType, PANEL_TYPE_LABELS_FA, error_message_fa
-from core.database.crud import create_server
+from core.database.crud import create_server, get_name
+from core.utils.username_utils import build_panel_username, legacy_panel_username, normalize_name
 from core.services.panel_client import MarzbanClient  # noqa: F401
 from bot.keyboards import get_panel_type_keyboard, get_confirm_server_keyboard
 
@@ -484,7 +485,12 @@ async def admin_approve_transaction(
         wallet_used = 0
 
     # 🌐 ساخت کاربر واقعی در پنل (via adapter)
-    username = f"U_{user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
+    # Read stored panel_username (N5: generated once at transaction creation)
+    if tx.panel_username:
+        username = tx.panel_username
+    else:
+        # Legacy transaction without panel_username - use legacy format
+        username = legacy_panel_username(user.telegram_id, tx.id, tx.created_at)
     data_limit_bytes = int(plan.volume_gb * 1073741824) if plan.volume_gb > 0 else 0
     duration_days = plan.days if plan.days > 0 else 0
     hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
@@ -3563,7 +3569,11 @@ async def admin_customer_service_monitor(
         return
 
     server: Server = tx.plan.server
-    username = f"U_{tx.user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
+    # Use stored panel_username if available, else fallback to legacy format
+    if tx.panel_username:
+        username = tx.panel_username
+    else:
+        username = legacy_panel_username(tx.user.telegram_id, tx.id, tx.created_at)
 
     adapter = get_adapter(server)
     remote_user = None

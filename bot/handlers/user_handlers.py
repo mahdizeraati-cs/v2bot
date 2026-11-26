@@ -19,7 +19,7 @@ from sqlalchemy.orm import selectinload
 
 from bot.config import BUTTONS, MESSAGES
 from bot.states import PurchaseStates, UserStates, WalletChargeStates
-from core.database.crud import get_or_create_user
+from core.database.crud import get_or_create_user, get_name, set_name, NameTaken
 from core.database.models import (
     DiscountCode,
     ForceJoinChannel,
@@ -34,6 +34,12 @@ from core.database.models import (
 from core.panels import UserSpec, get_adapter
 from core.services.panel_client import MarzbanClient  # noqa: F401
 from core.panels.base import PanelError
+from core.utils.username_utils import (
+    validate_name,
+    normalize_name,
+    build_panel_username_with_fallback,
+    legacy_panel_username,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +116,11 @@ async def cmd_start(message: types.Message, db_session: AsyncSession) -> None:
 # --- ۲. بازگشت به منوی اصلی ---
 @router.callback_query(F.data == "back_to_main")
 async def process_back_to_main(
-    callback: types.CallbackQuery, db_session: AsyncSession
+    callback: types.CallbackQuery, db_session: AsyncSession, state: FSMContext
 ) -> None:
     if not callback.from_user:
         return
+    await state.clear()
 
     first_name = (
         callback.from_user.first_name
@@ -451,8 +458,27 @@ async def skip_discount(
         await callback.answer()
         return
     data = await state.get_data()
+    user_id_raw = data.get("user_id")
+    if user_id_raw is None:
+        await callback.answer("❌ خطایی رخ داد.", show_alert=True)
+        return
+    user_id = int(user_id_raw)
+
     original_price_raw = data.get("original_price")
     original_price = int(original_price_raw) if original_price_raw is not None else 0
+
+    # Store purchase context before asking for name
+    await state.update_data(
+        discount_percent=0,
+        price_after_discount=original_price,
+        discount_code_id=None,
+    )
+
+    # Check if user has a chosen name
+    has_name = await _check_and_ask_name(state, db_session, user_id)
+    if not has_name:
+        await _ask_for_name(callback, state)
+        return
 
     if isinstance(callback.message, types.Message):
         await _create_purchase_invoice(
@@ -529,10 +555,131 @@ async def process_discount_code(
     discount_amount = original_price * discount_percent // 100
     price_after_discount = original_price - discount_amount
 
-    await state.update_data(discount_code_id=dc.id)
+    # Store purchase context before asking for name
+    await state.update_data(
+        discount_code_id=dc.id,
+        discount_percent=discount_percent,
+        price_after_discount=price_after_discount,
+    )
+
+    # Check if user has a chosen name
+    has_name = await _check_and_ask_name(state, db_session, user_id_db)
+    if not has_name:
+        await _ask_for_name(message, state)
+        return
+
     await _create_purchase_invoice(
         message, state, db_session, discount_percent, price_after_discount
     )
+
+
+async def _ask_for_name(
+    message: types.Message | types.CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Prompt user to enter their chosen name."""
+    text = (
+        "📝 <b>انتخاب نام کاربری</b>\n\n"
+        "برای ادامه خرید، لطفاً یک نام کاربری انتخاب کنید. این نام برای ساخت کانفیگ در سرور استفاده می‌شود و قابل تغییر نیست.\n\n"
+        "<b>قوانین نام کاربری:</b>\n"
+        "• فقط حروف انگلیسی، اعداد و زیرخط (_) مجاز است\n"
+        "• باید با حرف انگلیسی شروع شود\n"
+        "• حداقل ۳ کاراکتر، حداکثر ۱۱ کاراکتر\n"
+        "• نمی‌تواند شامل دو زیرخط متوالی (__) باشد\n"
+        "• نمی‌تواند با زیرخط شروع یا تمام شود\n"
+        "• نمی‌تواند فقط از اعداد تشکیل شده باشد\n"
+        "• کلمات رزرو شده: admin, owner, support, test, root, zz_smoke*\n\n"
+        "<b>مثال:</b> <code>my_name123</code>\n\n"
+        "نام کاربری خود را ارسال کنید:"
+    )
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")]
+        ]
+    )
+    if isinstance(message, types.CallbackQuery):
+        if message.message:
+            await message.message.edit_text(text, reply_markup=cancel_kb)
+    else:
+        await message.answer(text, reply_markup=cancel_kb)
+    await state.set_state(PurchaseStates.waiting_for_name)
+
+
+async def _check_and_ask_name(
+    state: FSMContext,
+    db_session: AsyncSession,
+    user_id: int,
+) -> bool:
+    """Check if user has a chosen name. If not, ask for it.
+    Returns True if user has name, False if name prompt was shown."""
+    chosen_name = await get_name(db_session, user_id)
+    if chosen_name is None:
+        # User doesn't have a name - we need to ask for it
+        # But we can't send message here without message/callback object
+        # This function just returns False, caller should call _ask_for_name
+        return False
+    return True
+
+
+@router.message(PurchaseStates.waiting_for_name)
+async def process_name_entry(
+    message: types.Message, state: FSMContext, db_session: AsyncSession
+) -> None:
+    """Handle user's chosen name entry."""
+    if not message.text or not message.from_user:
+        return
+
+    name = message.text.strip()
+
+    # Validate name
+    is_valid, error_msg = validate_name(name)
+    if not is_valid:
+        await message.answer(f"❌ {error_msg}\n\nلطفاً نام کاربری معتبر وارد کنید:")
+        return
+
+    # Normalize name for storage
+    normalized = normalize_name(name)
+
+    # Get database user_id from FSM data
+    data = await state.get_data()
+    user_id_db = data.get("user_id")
+    if user_id_db is None:
+        await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+        await state.clear()
+        return
+    user_id_db = int(user_id_db)
+
+    # Try to set the name
+    try:
+        await set_name(db_session, user_id_db, name, normalized)
+    except NameTaken as e:
+        await message.answer(f"❌ {e}\n\nلطفاً نام کاربری دیگر انتخاب کنید:")
+        return
+
+    # Name set successfully - resume purchase by calling _create_purchase_invoice
+    # which handles both wallet and card paths based on wallet balance
+    discount_percent = data.get("discount_percent", 0)
+    price_after_discount = data.get("price_after_discount")
+
+    if price_after_discount is not None:
+        await _create_purchase_invoice(
+            message, state, db_session, discount_percent, price_after_discount
+        )
+    else:
+        # Fallback - shouldn't happen with proper state preparation
+        await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+        await state.clear()
+
+
+@router.callback_query(F.data == "back_to_main", PurchaseStates.waiting_for_name)
+async def cancel_name_entry(
+    callback: types.CallbackQuery, state: FSMContext
+) -> None:
+    """Cancel name entry and return to main menu."""
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text("❌ ورود نام لغو شد.")
+    await callback.answer()
 
 
 async def _create_purchase_invoice(
@@ -634,6 +781,10 @@ async def _create_purchase_invoice(
         await state.clear()
         return
 
+    # Get chosen name for panel username
+    chosen_name = await get_name(db_session, user_id_db)
+    normalized_name = normalize_name(chosen_name) if chosen_name else None
+
     new_tx = Transaction(
         user_id=user_id_db,
         vendor_id=target_vendor_id,
@@ -647,6 +798,16 @@ async def _create_purchase_invoice(
         status="pending",
     )
     db_session.add(new_tx)
+    await db_session.flush()
+
+    # Build and store panel_username on transaction
+    if normalized_name:
+        panel_username = build_panel_username_with_fallback(
+            normalized_name, new_tx.id, user.telegram_id, int(new_tx.created_at.timestamp())
+        )
+    else:
+        panel_username = legacy_panel_username(user.telegram_id, new_tx.id, new_tx.created_at)
+    new_tx.panel_username = panel_username
     await db_session.flush()
 
     random_fee = (new_tx.id * 73) % 899 + 1
@@ -687,7 +848,7 @@ async def _create_purchase_invoice(
 # --- ۶.۵. هندلر پرداخت مستقیم و اتوماتیک از کیف پول ---
 @router.callback_query(F.data.startswith("wallet_buy_"))
 async def process_wallet_buy(
-    callback: types.CallbackQuery, db_session: AsyncSession
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
 ) -> None:
     if not callback.data or not callback.from_user:
         return
@@ -727,6 +888,23 @@ async def process_wallet_buy(
     discount_amount = original_price * discount_percent // 100
     final_price = original_price - discount_amount
 
+    # Store purchase context before asking for name
+    await state.update_data(
+        plan_id=plan_id,
+        user_id=user.id,
+        vendor_id=plan.vendor_id,
+        original_price=original_price,
+        discount_code_id=dc_id if dc_id > 0 else None,
+        discount_percent=discount_percent,
+        price_after_discount=final_price,
+    )
+
+    # Check if user has a chosen name
+    has_name = await _check_and_ask_name(state, db_session, user.id)
+    if not has_name:
+        await _ask_for_name(callback, state)
+        return
+
     if user.wallet_balance < final_price:
         await callback.answer(
             "❌ موجودی کیف پول شما تغییر کرده و کافی نیست!", show_alert=True
@@ -734,6 +912,10 @@ async def process_wallet_buy(
         return
 
     user.wallet_balance -= final_price
+
+    # Get chosen name for panel username
+    chosen_name = await get_name(db_session, user.id)
+    normalized_name = normalize_name(chosen_name) if chosen_name else None
 
     new_tx = Transaction(
         user_id=user.id,
@@ -749,11 +931,22 @@ async def process_wallet_buy(
     await db_session.commit()
     await db_session.refresh(new_tx)
 
+    # Build panel username using chosen name if available, else legacy format
+    if normalized_name:
+        username = build_panel_username_with_fallback(
+            normalized_name, new_tx.id, user.telegram_id, int(new_tx.created_at.timestamp())
+        )
+    else:
+        username = legacy_panel_username(user.telegram_id, new_tx.id, new_tx.created_at)
+    
+    # Store panel_username on transaction
+    new_tx.panel_username = username
+    await db_session.flush()
+
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text("⏳ در حال ارتباط با سرور و ساخت کانفیگ...")
 
     server = plan.server
-    username = f"U_{user.telegram_id}_{new_tx.id}_{int(new_tx.created_at.timestamp())}"
     data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
     duration_days = plan.days if plan.days > 0 else 0
     hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
@@ -1304,15 +1497,19 @@ async def process_my_services(
 async def process_service_monitoring(
     callback: types.CallbackQuery, db_session: AsyncSession
 ) -> None:
+    print(f"DEBUG HANDLER: ENTRY callback.data={callback.data}")
     if not callback.data or not callback.from_user:
         await callback.answer()
         return
 
     tx_id_str = callback.data.replace("usr_srv_", "")
+    print(f"DEBUG HANDLER: tx_id_str={tx_id_str}")
     if not tx_id_str.isdigit():
+        print(f"DEBUG HANDLER: tx_id_str not digit, returning")
         await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
         return
     tx_id = int(tx_id_str)
+    print(f"DEBUG HANDLER: tx_id={tx_id}")
 
     stmt = (
         select(Transaction)
@@ -1323,16 +1520,41 @@ async def process_service_monitoring(
         .where(Transaction.id == tx_id)
     )
     tx = (await db_session.execute(stmt)).scalar_one_or_none()
+    print(f"DEBUG HANDLER: tx = {tx}")
+    print(f"DEBUG HANDLER: tx is None = {tx is None}")
+    if tx:
+        print(f"DEBUG HANDLER: tx.user = {tx.user}")
+        print(f"DEBUG HANDLER: tx.plan = {tx.plan}")
+        if tx.plan:
+            print(f"DEBUG HANDLER: tx.plan.server = {tx.plan.server}")
     if not tx or not tx.user or not tx.plan or not tx.plan.server:
+        print(f"DEBUG HANDLER: tx check failed, returning")
         await callback.answer("❌ سرویس یافت نشد.", show_alert=True)
         return
 
+    print(f"DEBUG HANDLER: tx.user.telegram_id = {tx.user.telegram_id} (type={type(tx.user.telegram_id)})")
+    print(f"DEBUG HANDLER: callback.from_user.id = {callback.from_user.id} (type={type(callback.from_user.id)})")
+    print(f"DEBUG HANDLER: equal = {tx.user.telegram_id == callback.from_user.id}")
     if tx.user.telegram_id != callback.from_user.id:
+        print(f"DEBUG HANDLER: telegram_id mismatch, returning")
         await callback.answer("❌ دسترسی غیرمجاز.", show_alert=True)
         return
+    print(f"DEBUG HANDLER: telegram_id check passed")
+
+    print(f"DEBUG HANDLER: tx = {tx}")
+    print(f"DEBUG HANDLER: tx.panel_username = {tx.panel_username}")
+    print(f"DEBUG HANDLER: tx.user.telegram_id = {tx.user.telegram_id}")
+    print(f"DEBUG HANDLER: tx.id = {tx.id}")
+    print(f"DEBUG HANDLER: tx.created_at = {tx.created_at}")
+
+    from core.utils.username_utils import legacy_panel_username
 
     server: Server = tx.plan.server
-    username = f"U_{tx.user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
+    # Use stored panel_username if available, else fallback to legacy format
+    if tx.panel_username:
+        username = tx.panel_username
+    else:
+        username = legacy_panel_username(tx.user.telegram_id, tx.id, tx.created_at)
 
     adapter = get_adapter(server)
     remote_user = None

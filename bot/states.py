@@ -56,9 +56,10 @@ class EditPlanStates(StatesGroup):
     waiting_for_new_price = State()
 
 
-# 🌟 [جدید] وضعیتهای مربوط به تخفیف و خرید کاربر
+# 🌟 [جدید] وضعیتهای مربوط به تخفیف و خرید用户
 class PurchaseStates(StatesGroup):
     waiting_for_discount_code = State()
+    waiting_for_name = State()
 
 
 # 🌟 [جدید] وضعیتهای مدیریت کدهای تخفیف توسط ادمین
