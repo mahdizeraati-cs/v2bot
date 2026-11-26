@@ -214,3 +214,31 @@ class Ticket(Base):
 
     user = relationship("User", back_populates="tickets")
     vendor = relationship("Vendor", back_populates="tickets", foreign_keys=[vendor_id])
+
+
+class Partner(Base):
+    """Wholesale partner (buyer) model."""
+    __tablename__ = 'partners'
+
+    telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, server_default='false')
+    added_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    min_topup_toman: Mapped[int] = mapped_column(Integer, nullable=False)
+    discount_percent: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class PartnerAudit(Base):
+    """Audit log for partner promotions, term changes, and revocations."""
+    __tablename__ = 'partner_audit'
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    partner_telegram_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('partners.telegram_id', ondelete='RESTRICT'), nullable=False)
+    admin_telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    old_values: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    new_values: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    partner = relationship("Partner")

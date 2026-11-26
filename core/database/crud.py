@@ -1,9 +1,9 @@
 import os
 from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, update
+from sqlalchemy import select, desc, update, func
 from sqlalchemy.exc import IntegrityError
-from core.database.models import User, Vendor, Server
+from core.database.models import User, Vendor, Server, Partner, PartnerAudit
 
 
 async def _get_next_vendor_round_robin(session: AsyncSession) -> int | None:
@@ -201,3 +201,286 @@ async def get_name(session: AsyncSession, user_id: int) -> str | None:
     stmt = select(User.chosen_name).where(User.id == user_id)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+# ==================== Partner Repository Functions ====================
+
+async def is_partner(session: AsyncSession, telegram_id: int) -> bool:
+    """Check if a user is an active partner.
+
+    Args:
+        session: Database session
+        telegram_id: User's Telegram ID
+
+    Returns:
+        True if user is an active partner, False otherwise
+    """
+    stmt = select(Partner).where(
+        Partner.telegram_id == telegram_id,
+        Partner.is_active == True
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
+async def get_partner(session: AsyncSession, telegram_id: int) -> Partner | None:
+    """Get partner record by Telegram ID.
+
+    Args:
+        session: Database session
+        telegram_id: User's Telegram ID
+
+    Returns:
+        Partner object if found, None otherwise
+    """
+    stmt = select(Partner).where(Partner.telegram_id == telegram_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def list_partners(
+    session: AsyncSession,
+    vendor_id: int | None = None
+) -> list[Partner]:
+    """List all partners, optionally filtered by vendor.
+
+    Args:
+        session: Database session
+        vendor_id: Optional vendor ID to filter by
+
+    Returns:
+        List of Partner objects
+    """
+    stmt = select(Partner)
+    if vendor_id is not None:
+        # Join with users to filter by vendor_id
+        stmt = stmt.join(User, User.telegram_id == Partner.telegram_id).where(
+            User.vendor_id == vendor_id
+        )
+    stmt = stmt.order_by(Partner.created_at.desc())
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def promote_partner(
+    session: AsyncSession,
+    customer_telegram_id: int,
+    admin_telegram_id: int,
+    min_topup_toman: int,
+    discount_percent: int,
+) -> Partner:
+    """Promote an existing customer to wholesale partner.
+
+    Args:
+        session: Database session
+        customer_telegram_id: Telegram ID of the customer to promote
+        admin_telegram_id: Telegram ID of the admin/owner performing the promotion
+        min_topup_toman: Minimum top-up amount in Toman (must be > 0)
+        discount_percent: Discount percentage (1-90)
+
+    Returns:
+        The created/updated Partner object
+
+    Raises:
+        ValueError: If customer doesn't exist or invalid parameters
+    """
+    # Validate inputs
+    if min_topup_toman <= 0:
+        raise ValueError("min_topup_toman must be positive")
+    if discount_percent < 1 or discount_percent > 90:
+        raise ValueError("discount_percent must be between 1 and 90")
+
+    # Check if customer exists
+    stmt_user = select(User).where(User.telegram_id == customer_telegram_id)
+    result = await session.execute(stmt_user)
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise ValueError(f"Customer with telegram_id {customer_telegram_id} not found")
+
+    # Check if partner already exists
+    existing_partner = await get_partner(session, customer_telegram_id)
+    
+    if existing_partner is not None:
+        # Reactivation or terms update for existing partner
+        old_values = {
+            "is_active": existing_partner.is_active,
+            "min_topup_toman": existing_partner.min_topup_toman,
+            "discount_percent": existing_partner.discount_percent,
+        }
+        
+        existing_partner.is_active = True
+        existing_partner.added_by = admin_telegram_id
+        existing_partner.min_topup_toman = min_topup_toman
+        existing_partner.discount_percent = discount_percent
+        existing_partner.updated_at = func.now()
+        
+        await session.flush()
+        
+        # Audit the promotion/reactivation
+        audit = PartnerAudit(
+            partner_telegram_id=customer_telegram_id,
+            admin_telegram_id=admin_telegram_id,
+            action_type="promote",
+            old_values=old_values,
+            new_values={
+                "is_active": True,
+                "min_topup_toman": min_topup_toman,
+                "discount_percent": discount_percent,
+            },
+        )
+        session.add(audit)
+        
+        await session.commit()
+        await session.refresh(existing_partner)
+        return existing_partner
+    
+    # Create new partner
+    new_partner = Partner(
+        telegram_id=customer_telegram_id,
+        is_active=True,
+        added_by=admin_telegram_id,
+        min_topup_toman=min_topup_toman,
+        discount_percent=discount_percent,
+    )
+    session.add(new_partner)
+    await session.flush()
+    
+    # Audit the promotion
+    audit = PartnerAudit(
+        partner_telegram_id=customer_telegram_id,
+        admin_telegram_id=admin_telegram_id,
+        action_type="promote",
+        old_values=None,
+        new_values={
+            "is_active": True,
+            "min_topup_toman": min_topup_toman,
+            "discount_percent": discount_percent,
+        },
+    )
+    session.add(audit)
+    
+    await session.commit()
+    await session.refresh(new_partner)
+    return new_partner
+
+
+async def update_partner_terms(
+    session: AsyncSession,
+    partner_telegram_id: int,
+    admin_telegram_id: int,
+    min_topup_toman: int | None = None,
+    discount_percent: int | None = None,
+) -> Partner:
+    """Update partner terms (minimum top-up and/or discount percentage).
+
+    Args:
+        session: Database session
+        partner_telegram_id: Telegram ID of the partner
+        admin_telegram_id: Telegram ID of the admin/owner performing the update
+        min_topup_toman: New minimum top-up amount (optional)
+        discount_percent: New discount percentage (optional)
+
+    Returns:
+        The updated Partner object
+
+    Raises:
+        ValueError: If partner not found, not active, or invalid parameters
+    """
+    partner = await get_partner(session, partner_telegram_id)
+    if partner is None:
+        raise ValueError(f"Partner with telegram_id {partner_telegram_id} not found")
+    
+    if not partner.is_active:
+        raise ValueError(f"Partner with telegram_id {partner_telegram_id} is not active")
+
+    # Validate inputs
+    if min_topup_toman is not None and min_topup_toman <= 0:
+        raise ValueError("min_topup_toman must be positive")
+    if discount_percent is not None and (discount_percent < 1 or discount_percent > 90):
+        raise ValueError("discount_percent must be between 1 and 90")
+
+    # Track old values for audit
+    old_values = {
+        "min_topup_toman": partner.min_topup_toman,
+        "discount_percent": partner.discount_percent,
+    }
+
+    # Update fields if provided
+    if min_topup_toman is not None:
+        partner.min_topup_toman = min_topup_toman
+    if discount_percent is not None:
+        partner.discount_percent = discount_percent
+    
+    partner.updated_at = func.now()
+    
+    await session.flush()
+
+    # Audit the terms change
+    new_values = {
+        "min_topup_toman": partner.min_topup_toman,
+        "discount_percent": partner.discount_percent,
+    }
+    
+    audit = PartnerAudit(
+        partner_telegram_id=partner_telegram_id,
+        admin_telegram_id=admin_telegram_id,
+        action_type="update_terms",
+        old_values=old_values,
+        new_values=new_values,
+    )
+    session.add(audit)
+
+    await session.commit()
+    await session.refresh(partner)
+    return partner
+
+
+async def revoke_partner(
+    session: AsyncSession,
+    partner_telegram_id: int,
+    admin_telegram_id: int,
+) -> Partner:
+    """Revoke partner status (deactivate).
+
+    Args:
+        session: Database session
+        partner_telegram_id: Telegram ID of the partner
+        admin_telegram_id: Telegram ID of the admin/owner performing the revocation
+
+    Returns:
+        The updated Partner object with is_active=False
+
+    Raises:
+        ValueError: If partner not found or already inactive
+    """
+    partner = await get_partner(session, partner_telegram_id)
+    if partner is None:
+        raise ValueError(f"Partner with telegram_id {partner_telegram_id} not found")
+
+    if not partner.is_active:
+        raise ValueError(f"Partner with telegram_id {partner_telegram_id} is already inactive")
+
+    old_values = {
+        "is_active": True,
+        "min_topup_toman": partner.min_topup_toman,
+        "discount_percent": partner.discount_percent,
+    }
+
+    partner.is_active = False
+    partner.updated_at = func.now()
+    
+    await session.flush()
+
+    # Audit the revocation
+    audit = PartnerAudit(
+        partner_telegram_id=partner_telegram_id,
+        admin_telegram_id=admin_telegram_id,
+        action_type="revoke",
+        old_values=old_values,
+        new_values={"is_active": False},
+    )
+    session.add(audit)
+
+    await session.commit()
+    await session.refresh(partner)
+    return partner
