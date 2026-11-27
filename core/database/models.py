@@ -163,6 +163,9 @@ class Transaction(Base):
     # 🌟 [جدید] فیلدهای تخفیف و ریدایرکت برای حسابداری دقیق
     discount_percent: Mapped[int] = mapped_column(Integer, default=0)
     original_amount: Mapped[int] = mapped_column(Integer, default=0)
+    # 🌟 [جدید] فیلدهای قیمت برای خریدهای شراکتی
+    list_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    final_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 🌟 [جدید] ارجاع به کد تخفیف استفادهشده (SET NULL تا سابقه مالی پس از حذف کد حفظ شود)
     discount_code_id: Mapped[int | None] = mapped_column(ForeignKey('discount_codes.id', ondelete="SET NULL"), nullable=True)
     origin_vendor_id: Mapped[int | None] = mapped_column(ForeignKey('vendors.id', ondelete='SET NULL'), nullable=True)

@@ -2,7 +2,7 @@ import io
 import logging
 import random  # noqa: F401
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import qrcode
@@ -13,7 +13,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -44,7 +44,7 @@ from core.utils.username_utils import (
     build_panel_username_with_fallback,
     legacy_panel_username,
 )
-from core.utils.partner_utils import min_topup_ok, to_persian_digits
+from core.utils.partner_utils import discounted_price, min_topup_ok, to_persian_digits
 
 logger = logging.getLogger(__name__)
 
@@ -438,7 +438,6 @@ async def process_partner_server_selection(
 
     for plan in plans:
         # Calculate partner price
-        from core.utils.partner_utils import discounted_price
         partner_price = discounted_price(int(plan.price), partner.discount_percent)
         btn_text = f"🪫 {plan.title} - {partner_price:,} تومان (تخفیف {partner.discount_percent}%)"
         builder.button(text=btn_text, callback_data=f"partner_buy_plan_{plan.id}")
@@ -607,7 +606,6 @@ async def process_partner_plan_selection(
     desc_text = plan.description if plan.description else "ندارد"
 
     # Calculate partner price
-    from core.utils.partner_utils import discounted_price
     original_price = int(plan.price)
     final_price = discounted_price(original_price, partner.discount_percent)
 
@@ -924,19 +922,142 @@ async def process_name_entry(
         await message.answer(f"❌ {e}\n\nلطفاً نام کاربری دیگر انتخاب کنید:")
         return
 
-    # Name set successfully - resume purchase by calling _create_purchase_invoice
-    # which handles both wallet and card paths based on wallet balance
-    discount_percent = data.get("discount_percent", 0)
+    # Name set successfully - resume purchase
+    # Check if this is a partner purchase
+    is_partner_purchase = data.get("is_partner", False)
     price_after_discount = data.get("price_after_discount")
 
-    if price_after_discount is not None:
-        await _create_purchase_invoice(
-            message, state, db_session, discount_percent, price_after_discount
-        )
-    else:
-        # Fallback - shouldn't happen with proper state preparation
+    if price_after_discount is None:
         await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
         await state.clear()
+        return
+
+    if is_partner_purchase:
+        # Partner purchase: go directly to execute_wallet_purchase (no confirmation screen)
+        # Fetch required objects from database
+        plan_id = data.get("plan_id")
+        if plan_id is None:
+            await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+            await state.clear()
+            return
+        plan_id = int(plan_id)
+        
+        user = await db_session.get(User, user_id_db)
+        plan = await db_session.get(Plan, plan_id)
+        if not user or not plan:
+            await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+            await state.clear()
+            return
+        
+        # Load server relationship
+        await db_session.refresh(plan, attribute_names=['server'])
+        server = plan.server
+        if not server:
+            await message.answer("❌ سرور یافت نشد.")
+            await state.clear()
+            return
+
+        original_price = data.get("original_price")
+        discount_percent = data.get("discount_percent", 0)
+        discount_code_id = data.get("discount_code_id")
+        final_price = int(price_after_discount)
+        
+        try:
+            new_tx, sub_url = await execute_wallet_purchase(
+                db_session=db_session,
+                user=user,
+                plan=plan,
+                server=server,
+                list_price=int(original_price) if original_price else 0,
+                discount_percent=int(discount_percent),
+                final_price=final_price,
+                discount_code_id=discount_code_id,
+                is_partner=True,
+            )
+        except ValueError as e:
+            await message.answer(f"❌ {e}")
+            return
+        except Exception as e:
+            logger.error(f"Partner wallet purchase failed for user {user.telegram_id}: {e}")
+            await message.answer("❌ خطایی در پردازش خرید رخ داد.")
+            return
+
+        # Success - send subscription
+        caption = (
+            f"✅ <b>خرید شما با موفقیت انجام شد!</b>\n\n"
+            f"🤝 خرید با تخیف همکار: {discount_percent}%\n"
+            f"🛍 پلن: {plan.title}\n"
+            f"🖥 سرور: {server.name}\n\n"
+            f"🔗 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
+        )
+        try:
+            import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
+
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=_qr_constants.ERROR_CORRECT_M,
+                box_size=10,
+                border=4,
+            )  # type: ignore[call-overload]
+            qr.add_data(sub_url)
+            qr.make(fit=True)
+            qr_image = qr.make_image(fill_color="black", back_color="white")
+            stream = io.BytesIO()
+            qr_image.save(stream, "PNG")  # type: ignore[call-arg]
+            stream.seek(0)
+            qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
+            await message.answer_photo(photo=qr_file, caption=caption)
+        except Exception:
+            await message.answer(caption)
+
+        # Send main menu
+        wallet_balance = int(user.wallet_balance)
+        first_name = message.from_user.first_name if message.from_user else MESSAGES.get("default_user", "کاربر")
+        welcome_text = MESSAGES["welcome"].format(name=first_name, balance=wallet_balance)
+
+        # Rebuild keyboard with partner button if still active
+        partner_active = await is_partner(db_session, user.telegram_id)
+        keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["buy_new_service"], callback_data="buy_new_service"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["my_services"], callback_data="my_services"
+                ),
+                InlineKeyboardButton(
+                    text=BUTTONS["charge_wallet"], callback_data="charge_wallet"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["user_profile"], callback_data="user_profile"
+                ),
+                InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["free_test"], callback_data="free_test_start"
+                )
+            ],
+        ]
+        if partner_active:
+            keyboard_rows.insert(1, [
+                InlineKeyboardButton(
+                    text=BUTTONS["partner_purchases"], callback_data="partner_buy_service"
+                )
+            ])
+        main_menu_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+        await message.answer(text=welcome_text, reply_markup=main_menu_keyboard)
+        await state.clear()
+        return
+
+    # Normal customer purchase: show confirmation via _create_purchase_invoice
+    discount_percent = data.get("discount_percent", 0)
+    await _create_purchase_invoice(
+        message, state, db_session, discount_percent, price_after_discount
+    )
 
 
 @router.callback_query(F.data == "back_to_main", PurchaseStates.waiting_for_name)
@@ -1064,6 +1185,7 @@ async def _create_purchase_invoice(
         discount_code_id=discount_code_id,
         destination_card=target_vendor.card_number,
         status="pending",
+        created_at=datetime.now(timezone.utc),
     )
     db_session.add(new_tx)
     await db_session.flush()
@@ -1113,6 +1235,155 @@ async def _create_purchase_invoice(
     await state.set_state(WalletChargeStates.waiting_for_receipt)
 
 
+async def execute_wallet_purchase(
+    db_session: AsyncSession,
+    user: User,
+    plan: Plan,
+    server: Server,
+    list_price: int,
+    discount_percent: int,
+    final_price: int,
+    discount_code_id: Optional[int],
+    is_partner: bool = False,
+) -> tuple[Transaction, str]:
+    """
+    Execute wallet purchase with atomic wallet debit and panel provisioning.
+    
+    This is the shared implementation for both normal and partner purchases.
+    
+    Args:
+        db_session: Database session
+        user: The User making the purchase
+        plan: The Plan being purchased
+        server: The Server hosting the plan
+        list_price: Original plan price (before discount)
+        discount_percent: Discount percentage applied (partner or coupon)
+        final_price: Final price after discount
+        discount_code_id: ID of discount code used (None for partner purchases)
+        is_partner: Whether this is a partner purchase
+    
+    Returns:
+        Tuple of (Transaction, subscription_url)
+    
+    Raises:
+        Exception: On wallet debit failure, panel failure, or other errors
+    """
+    # Step 1: Atomic wallet debit
+    # Use raw SQL UPDATE with WHERE clause to ensure atomicity
+    # This prevents race conditions from concurrent purchases
+    result = await db_session.execute(
+        text(
+            "UPDATE users SET wallet_balance = wallet_balance - :price "
+            "WHERE id = :user_id AND wallet_balance >= :price"
+        ),
+        {"price": final_price, "user_id": user.id},
+    )
+    
+    if result.rowcount == 0:
+        # Wallet debit failed - insufficient balance or concurrent purchase
+        raise ValueError("موجودی کیف پول شما برای این خرید کافی نیست یا خرید همزمان رخ داده است.")
+    
+    # Refresh user to get updated wallet balance
+    await db_session.refresh(user)
+    
+    # Step 2: Create transaction with status='pending'
+    # We'll update to 'approved' after successful panel creation
+    chosen_name = await get_name(db_session, user.id)
+    normalized_name = normalize_name(chosen_name) if chosen_name else None
+    
+    new_tx = Transaction(
+        user_id=user.id,
+        vendor_id=plan.vendor_id,
+        plan_id=plan.id,
+        amount=0,  # Wallet purchase - no card payment
+        original_amount=list_price,
+        discount_percent=discount_percent,
+        discount_code_id=discount_code_id,
+        status="pending",
+        list_price=list_price,
+        final_price=final_price,
+        created_at=datetime.now(timezone.utc),
+    )
+    db_session.add(new_tx)
+    await db_session.flush()  # Get transaction ID for panel username
+    
+    # Build panel username
+    if normalized_name:
+        username = build_panel_username_with_fallback(
+            normalized_name, new_tx.id, user.telegram_id, int(new_tx.created_at.timestamp())
+        )
+    else:
+        username = legacy_panel_username(user.telegram_id, new_tx.id, new_tx.created_at)
+    
+    new_tx.panel_username = username
+    await db_session.flush()
+    
+    # Step 3: Update transaction status to 'approved' after successful debit
+    # The wallet is already debited, now we commit the transaction
+    new_tx.status = "approved"
+    await db_session.commit()
+    await db_session.refresh(new_tx)
+    
+    # Step 4: Panel provisioning
+    data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
+    duration_days = plan.days if plan.days > 0 else 0
+    hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
+    
+    spec = UserSpec(
+        username=username,
+        data_limit_bytes=data_limit_bytes,
+        duration_days=duration_days,
+        note="",
+        hwid_limit=hwid_limit,
+    )
+    
+    adapter = get_adapter(server)
+    sub_url = ""
+    try:
+        remote_user = await adapter.create_user(spec)
+        sub_url = remote_user.subscription_url
+        # Store the actual panel UUID for Hiddify
+        new_tx.remote_user_id = remote_user.remote_id
+        new_tx.status = "approved"
+        await db_session.flush()
+    except Exception as e:
+        logger.error(f"Config creation failed for user {user.telegram_id} on server {server.id}: {e}")
+        # Step 5: Exactly-once refund on panel failure
+        # Use conditional status update to ensure refund happens only once
+        refund_result = await db_session.execute(
+            text(
+                "UPDATE transactions SET status = 'failed' "
+                "WHERE id = :tx_id AND status = 'approved'"
+            ),
+            {"tx_id": new_tx.id},
+        )
+        
+        if refund_result.rowcount > 0:
+            # Only refund if we successfully updated the status
+            # Atomic wallet credit
+            await db_session.execute(
+                text(
+                    "UPDATE users SET wallet_balance = wallet_balance + :price "
+                    "WHERE id = :user_id"
+                ),
+                {"price": final_price, "user_id": user.id},
+            )
+            await db_session.commit()
+        else:
+            # Transaction already failed/refunded by another process
+            await db_session.rollback()
+        
+        await adapter.aclose()
+        raise  # Re-raise to let caller handle user notification
+    finally:
+        if 'adapter' in locals():
+            await adapter.aclose()
+    
+    # Success - commit final status
+    await db_session.commit()
+    return new_tx, sub_url
+
+
 # --- ۶.۵. هندلر پرداخت مستقیم و اتوماتیک از کیف پول ---
 @router.callback_query(F.data.startswith("wallet_buy_"))
 async def process_wallet_buy(
@@ -1144,6 +1415,7 @@ async def process_wallet_buy(
 
     original_price = int(plan.price)
     discount_percent = 0
+    discount_code_id = None
     if dc_id > 0:
         dc = (
             await db_session.execute(
@@ -1152,6 +1424,7 @@ async def process_wallet_buy(
         ).scalar_one_or_none()
         if dc:
             discount_percent = dc.discount_percent
+            discount_code_id = dc_id
 
     discount_amount = original_price * discount_percent // 100
     final_price = original_price - discount_amount
@@ -1162,9 +1435,10 @@ async def process_wallet_buy(
         user_id=user.id,
         vendor_id=plan.vendor_id,
         original_price=original_price,
-        discount_code_id=dc_id if dc_id > 0 else None,
+        discount_code_id=discount_code_id,
         discount_percent=discount_percent,
         price_after_discount=final_price,
+        is_partner=False,
     )
 
     # Check if user has a chosen name
@@ -1173,125 +1447,64 @@ async def process_wallet_buy(
         await _ask_for_name(callback, state)
         return
 
-    if user.wallet_balance < final_price:
-        await callback.answer(
-            "❌ موجودی کیف پول شما تغییر کرده و کافی نیست!", show_alert=True
+    # User has name - proceed with purchase using shared helper
+    server = plan.server
+    try:
+        new_tx, sub_url = await execute_wallet_purchase(
+            db_session=db_session,
+            user=user,
+            plan=plan,
+            server=server,
+            list_price=original_price,
+            discount_percent=discount_percent,
+            final_price=final_price,
+            discount_code_id=discount_code_id,
+            is_partner=False,
         )
+    except ValueError as e:
+        await callback.answer(f"❌ {e}", show_alert=True)
+        return
+    except Exception as e:
+        logger.error(f"Wallet purchase failed for user {user.telegram_id}: {e}")
+        await callback.answer("❌ خطایی در پردازش خرید رخ داد.", show_alert=True)
         return
 
-    user.wallet_balance -= final_price
-
-    # Get chosen name for panel username
-    chosen_name = await get_name(db_session, user.id)
-    normalized_name = normalize_name(chosen_name) if chosen_name else None
-
-    new_tx = Transaction(
-        user_id=user.id,
-        vendor_id=plan.vendor_id,
-        plan_id=plan.id,
-        amount=0,
-        original_amount=original_price,
-        discount_percent=discount_percent,
-        discount_code_id=dc_id if dc_id > 0 else None,
-        status="approved",
+    # Success - send subscription
+    caption = (
+        f"✅ <b>خرید شما با موفقیت انجام شد!</b>\n\n"
+        f"🛍 پلن: {plan.title}\n"
+        f"🖥 سرور: {server.name}\n\n"
+        f"🔗 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
     )
-    db_session.add(new_tx)
-    await db_session.commit()
-    await db_session.refresh(new_tx)
-
-    # Build panel username using chosen name if available, else legacy format
-    if normalized_name:
-        username = build_panel_username_with_fallback(
-            normalized_name, new_tx.id, user.telegram_id, int(new_tx.created_at.timestamp())
-        )
-    else:
-        username = legacy_panel_username(user.telegram_id, new_tx.id, new_tx.created_at)
-    
-    # Store panel_username on transaction
-    new_tx.panel_username = username
-    await db_session.flush()
-
-    if isinstance(callback.message, types.Message):
-        await callback.message.edit_text("⏳ در حال ارتباط با سرور و ساخت کانفیگ...")
-
-    server = plan.server
-    data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
-    duration_days = plan.days if plan.days > 0 else 0
-    hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
-
-    spec = UserSpec(
-        username=username,
-        data_limit_bytes=data_limit_bytes,
-        duration_days=duration_days,
-        note="",
-        hwid_limit=hwid_limit,
-    )
-
-    adapter = get_adapter(server)
-    sub_url = ""
     try:
-        remote_user = await adapter.create_user(spec)
-        sub_url = remote_user.subscription_url
-        # Store the actual panel UUID for Hiddify (panel may generate its own UUID)
-        new_tx.remote_user_id = remote_user.remote_id
-        new_tx.status = "approved"
-        await db_session.flush()
-    except PanelError as e:
-        logger.error(f"Config creation via Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
-    except Exception as e:
-        logger.error(f"Config creation via Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
-    finally:
-        await adapter.aclose()
+        import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
 
-    if sub_url:
-        caption = (
-            f"✅ <b>خرید شما با موفقیت انجام شد!</b>\n\n"
-            f"🛍 پلن: {plan.title}\n"
-            f"🖥 سرور: {server.name}\n\n"
-            f"🔗 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
-        )
-        try:
-            import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
-
-            qr = qrcode.QRCode(
-                version=1,
-                error_correction=_qr_constants.ERROR_CORRECT_M,
-                box_size=10,
-                border=4,
-            )  # type: ignore[call-overload]
-            qr.add_data(sub_url)
-            qr.make(fit=True)
-            qr_image = qr.make_image(fill_color="black", back_color="white")
-            stream = io.BytesIO()
-            qr_image.save(stream, "PNG")  # type: ignore[call-arg]
-            stream.seek(0)
-            qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
-            if isinstance(callback.message, types.Message):
-                await callback.message.delete()
-            if callback.bot is not None:
-                await callback.bot.send_photo(
-                    chat_id=user.telegram_id,
-                    photo=qr_file,
-                    caption=caption,
-                )
-        except Exception:
-            if isinstance(callback.message, types.Message):
-                await callback.message.edit_text(caption)
-    else:
-        user.wallet_balance += final_price
-        new_tx.status = "failed"
-        await db_session.commit()
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=_qr_constants.ERROR_CORRECT_M,
+            box_size=10,
+            border=4,
+        )  # type: ignore[call-overload]
+        qr.add_data(sub_url)
+        qr.make(fit=True)
+        qr_image = qr.make_image(fill_color="black", back_color="white")
+        stream = io.BytesIO()
+        qr_image.save(stream, "PNG")  # type: ignore[call-arg]
+        stream.seek(0)
+        qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
         if isinstance(callback.message, types.Message):
-            try:
-                await callback.message.delete()
-            except Exception:
-                pass
-
+            await callback.message.delete()
         if callback.bot is not None:
-            await callback.bot.send_message(
+            await callback.bot.send_photo(
                 chat_id=user.telegram_id,
-                text="❌ متاسفانه در ارتباط با سرور مشکلی پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد."
+                photo=qr_file,
+                caption=caption,
             )
+    except Exception:
+        if isinstance(callback.message, types.Message):
+            await callback.message.edit_text(caption)
+
+    # Send main menu
     if callback.bot is not None:
         wallet_balance = int(user.wallet_balance)
         first_name = callback.from_user.first_name if callback.from_user else MESSAGES.get("default_user", "کاربر")
@@ -1351,91 +1564,59 @@ async def process_partner_wallet_buy(
     original_price = int(plan.price)
     final_price = discounted_price(original_price, partner.discount_percent)
 
+    # Store purchase context in state (for name entry continuation)
+    await state.update_data(
+        plan_id=plan_id,
+        user_id=user.id,
+        vendor_id=plan.vendor_id,
+        original_price=original_price,
+        discount_code_id=None,
+        discount_percent=partner.discount_percent,
+        price_after_discount=final_price,
+        is_partner=True,
+        partner_discount_percent=partner.discount_percent,
+    )
+
     # Check if user has a chosen name
     has_name = await _check_and_ask_name(state, db_session, user.id)
     if not has_name:
         await _ask_for_name(callback, state)
         return
 
-    if user.wallet_balance < final_price:
-        await callback.answer(
-            "❌ موجودی کیف پول شما تغییر کرده و کافی نیست!", show_alert=True
-        )
-        return
-
-    user.wallet_balance -= final_price
-
-    # Get chosen name for panel username
-    chosen_name = await get_name(db_session, user.id)
-    normalized_name = normalize_name(chosen_name) if chosen_name else None
-
-    new_tx = Transaction(
-        user_id=user.id,
-        vendor_id=plan.vendor_id,
-        plan_id=plan.id,
-        amount=0,
-        original_amount=original_price,
-        discount_percent=partner.discount_percent,
-        discount_code_id=None,
-        status="approved",
-        list_price=original_price,
-        final_price=final_price,
-    )
-    db_session.add(new_tx)
-    await db_session.commit()
-    await db_session.refresh(new_tx)
-
-    # Build panel username using chosen name if available, else legacy format
-    if normalized_name:
-        username = build_panel_username_with_fallback(
-            normalized_name, new_tx.id, user.telegram_id, int(new_tx.created_at.timestamp())
-        )
-    else:
-        username = legacy_panel_username(user.telegram_id, new_tx.id, new_tx.created_at)
-    
-    # Store panel_username on transaction
-    new_tx.panel_username = username
-    await db_session.flush()
-
-    if isinstance(callback.message, types.Message):
-        await callback.message.edit_text("⏳ در حال ارتباط با سرور و ساخت کانفیگ...")
-
+    # User has name - proceed with purchase using shared helper
     server = plan.server
-    data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
-    duration_days = plan.days if plan.days > 0 else 0
-    hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
-
-    spec = UserSpec(
-        username=username,
-        data_limit_bytes=data_limit_bytes,
-        duration_days=duration_days,
-        note="",
-        hwid_limit=hwid_limit,
-    )
-
-    adapter = get_adapter(server)
-    sub_url = ""
     try:
-        remote_user = await adapter.create_user(spec)
-        sub_url = remote_user.subscription_url
-        # Store the actual panel UUID for Hiddify (panel may generate its own UUID)
-        new_tx.remote_user_id = remote_user.remote_id
-        new_tx.status = "approved"
-        await db_session.flush()
-    except PanelError as e:
-        logger.error(f"Config creation via Partner Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
+        new_tx, sub_url = await execute_wallet_purchase(
+            db_session=db_session,
+            user=user,
+            plan=plan,
+            server=server,
+            list_price=original_price,
+            discount_percent=partner.discount_percent,
+            final_price=final_price,
+            discount_code_id=None,
+            is_partner=True,
+        )
+    except ValueError as e:
+        await callback.answer(f"❌ {e}", show_alert=True)
+        return
     except Exception as e:
-        logger.error(f"Config creation via Partner Wallet Buy failed for user {user.telegram_id} on server {server.id}: {e}")
-    finally:
-        await adapter.aclose()
+        logger.error(f"Partner wallet purchase failed for user {user.telegram_id}: {e}")
+        # Send refund notification message for panel failures
+        if callback.bot is not None:
+            await callback.bot.send_message(
+                chat_id=user.telegram_id,
+                text="❌ متاسفانه در ارتباط با سرور مشکل پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد."
+            )
+        return
 
     if sub_url:
         caption = (
-            f"\u2705 <b>خرید شما با موفقیت انجام شد!</b>\n\n"
-            f"\u062eوش با تخیف همکار: {partner.discount_percent}%\n"
-            f"\ud83c\udf7d پلن: {plan.title}\n"
-            f"\ud83d\udda5 سرور: {server.name}\n\n"
-            f"\ud83d\udd17 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
+            f"✅ <b>خرید شما با موفقیت انجام شد!</b>\n\n"
+            f"🤝 خرید با تخیف همکار: {partner.discount_percent}%\n"
+            f"🛍 پلن: {plan.title}\n"
+            f"🖥 سرور: {server.name}\n\n"
+            f"🔗 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
         )
         try:
             import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
@@ -1465,9 +1646,7 @@ async def process_partner_wallet_buy(
             if isinstance(callback.message, types.Message):
                 await callback.message.edit_text(caption)
     else:
-        user.wallet_balance += final_price
-        new_tx.status = "failed"
-        await db_session.commit()
+        # This shouldn't happen since execute_wallet_purchase handles refund on failure
         if isinstance(callback.message, types.Message):
             try:
                 await callback.message.delete()
@@ -1477,8 +1656,10 @@ async def process_partner_wallet_buy(
         if callback.bot is not None:
             await callback.bot.send_message(
                 chat_id=user.telegram_id,
-                text="❌ متاسفانه در ارتباط با سرور مشکل پیش آمد. مبلغ به طور کامل به قیمت پول شما برگرگشت شد."
+                text="❌ متاسفانه در ارتباط با سرور مشکل پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد."
             )
+    
+    # Send main menu
     if callback.bot is not None:
         wallet_balance = int(user.wallet_balance)
         first_name = callback.from_user.first_name if callback.from_user else MESSAGES.get("default_user", "کاربر")
@@ -1497,8 +1678,7 @@ async def process_partner_wallet_buy(
                     text=BUTTONS["my_services"], callback_data="my_services"
                 ),
                 InlineKeyboardButton(
-                    text=BUTTONS["charge_wallet"], callback_data="charge_wallet"
-                ),
+                    text=BUTTONS["charge_wallet"], callback_data="charge_wallet"),
             ],
             [
                 InlineKeyboardButton(
