@@ -6,6 +6,11 @@ No database, no handlers, no I/O.
 
 
 
+def to_persian_digits(text: str) -> str:
+    """Convert Western digits to Persian/Arabic digits."""
+    persian_digits = "۰۱۲۳۴۵۶۷۸۹"
+    return "".join(persian_digits[int(c)] if c.isdigit() else c for c in text)
+
 
 class PartnerValidationError(ValueError):
     """Raised when partner validation fails."""

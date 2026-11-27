@@ -44,6 +44,7 @@ from core.utils.username_utils import (
     build_panel_username_with_fallback,
     legacy_panel_username,
 )
+from core.utils.partner_utils import min_topup_ok, to_persian_digits
 
 logger = logging.getLogger(__name__)
 
@@ -1705,17 +1706,32 @@ async def ask_charge_amount(
 async def process_charge_amount(
     message: types.Message, state: FSMContext, db_session: AsyncSession
 ) -> None:
-    if not message.from_user or not message.text:
+    if not message.from_user:
         return
 
-    if not message.text.isdigit():
+    if not message.text or not message.text.isdigit():
         await message.answer("❌ لطفاً مبلغ را فقط به صورت عدد وارد کنید.")
         return
 
     base_amount = int(message.text)
-    if base_amount < 10000:
-        await message.answer("❌ حداقل مبلغ شارژ ۱۰,۰۰۰ تومان است.")
-        return
+
+    # Check if user is an active partner
+    partner = await get_partner(db_session, message.from_user.id)
+    if partner and partner.is_active:
+        # Active partner: use their individual minimum
+        min_amount = partner.min_topup_toman
+        if not min_topup_ok(base_amount, min_amount):
+            await message.answer(
+                to_persian_digits(
+                    f"❌ حداقل مبلغ شارژ برای حساب همکاری شما {min_amount:,} تومان است."
+                )
+            )
+            return
+    else:
+        # Normal customer or deactivated partner: use existing minimum
+        if base_amount < 10000:
+            await message.answer("❌ حداقل مبلغ شارژ ۱۰,۰۰۰ تومان است.")
+            return
 
     stmt = (
         select(User, Vendor)
