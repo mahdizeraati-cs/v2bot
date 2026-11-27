@@ -116,7 +116,7 @@ async def cmd_start(message: types.Message, db_session: AsyncSession) -> None:
             )
         ],
     ]
-    
+
     if partner_active:
         keyboard_rows.insert(1, [
             InlineKeyboardButton(
@@ -178,7 +178,7 @@ async def process_back_to_main(
             )
         ],
     ]
-    
+
     if partner_active:
         keyboard_rows.insert(1, [
             InlineKeyboardButton(
@@ -850,7 +850,7 @@ async def _ask_for_name(
         "<b>قوانین نام کاربری:</b>\n"
         "• فقط حروف انگلیسی، اعداد و زیرخط (_) مجاز است\n"
         "• باید با حرف انگلیسی شروع شود\n"
-        "• حداقل ۳ کاراکتر، حداکثر ۱۱ کاراکتر\n"
+        "• حداقل 3 کاراکتر، حداکثر 21 کاراکتر\n"
         "• نمی‌تواند شامل دو زیرخط متوالی (__) باشد\n"
         "• نمی‌تواند با زیرخط شروع یا تمام شود\n"
         "• نمی‌تواند فقط از اعداد تشکیل شده باشد\n"
@@ -941,14 +941,14 @@ async def process_name_entry(
             await state.clear()
             return
         plan_id = int(plan_id)
-        
+
         user = await db_session.get(User, user_id_db)
         plan = await db_session.get(Plan, plan_id)
         if not user or not plan:
             await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
             await state.clear()
             return
-        
+
         # Load server relationship
         await db_session.refresh(plan, attribute_names=['server'])
         server = plan.server
@@ -961,7 +961,7 @@ async def process_name_entry(
         discount_percent = data.get("discount_percent", 0)
         discount_code_id = data.get("discount_code_id")
         final_price = int(price_after_discount)
-        
+
         try:
             new_tx, sub_url = await execute_wallet_purchase(
                 db_session=db_session,
@@ -1248,9 +1248,9 @@ async def execute_wallet_purchase(
 ) -> tuple[Transaction, str]:
     """
     Execute wallet purchase with atomic wallet debit and panel provisioning.
-    
+
     This is the shared implementation for both normal and partner purchases.
-    
+
     Args:
         db_session: Database session
         user: The User making the purchase
@@ -1261,10 +1261,10 @@ async def execute_wallet_purchase(
         final_price: Final price after discount
         discount_code_id: ID of discount code used (None for partner purchases)
         is_partner: Whether this is a partner purchase
-    
+
     Returns:
         Tuple of (Transaction, subscription_url)
-    
+
     Raises:
         Exception: On wallet debit failure, panel failure, or other errors
     """
@@ -1278,19 +1278,19 @@ async def execute_wallet_purchase(
         ),
         {"price": final_price, "user_id": user.id},
     )
-    
+
     if result.rowcount == 0:
         # Wallet debit failed - insufficient balance or concurrent purchase
         raise ValueError("موجودی کیف پول شما برای این خرید کافی نیست یا خرید همزمان رخ داده است.")
-    
+
     # Refresh user to get updated wallet balance
     await db_session.refresh(user)
-    
+
     # Step 2: Create transaction with status='pending'
     # We'll update to 'approved' after successful panel creation
     chosen_name = await get_name(db_session, user.id)
     normalized_name = normalize_name(chosen_name) if chosen_name else None
-    
+
     new_tx = Transaction(
         user_id=user.id,
         vendor_id=plan.vendor_id,
@@ -1306,7 +1306,7 @@ async def execute_wallet_purchase(
     )
     db_session.add(new_tx)
     await db_session.flush()  # Get transaction ID for panel username
-    
+
     # Build panel username
     if normalized_name:
         username = build_panel_username_with_fallback(
@@ -1314,21 +1314,21 @@ async def execute_wallet_purchase(
         )
     else:
         username = legacy_panel_username(user.telegram_id, new_tx.id, new_tx.created_at)
-    
+
     new_tx.panel_username = username
     await db_session.flush()
-    
+
     # Step 3: Update transaction status to 'approved' after successful debit
     # The wallet is already debited, now we commit the transaction
     new_tx.status = "approved"
     await db_session.commit()
     await db_session.refresh(new_tx)
-    
+
     # Step 4: Panel provisioning
     data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
     duration_days = plan.days if plan.days > 0 else 0
     hwid_limit = plan.user_limit if plan.user_limit > 0 else 0
-    
+
     spec = UserSpec(
         username=username,
         data_limit_bytes=data_limit_bytes,
@@ -1336,7 +1336,7 @@ async def execute_wallet_purchase(
         note="",
         hwid_limit=hwid_limit,
     )
-    
+
     adapter = get_adapter(server)
     sub_url = ""
     try:
@@ -1357,7 +1357,7 @@ async def execute_wallet_purchase(
             ),
             {"tx_id": new_tx.id},
         )
-        
+
         if refund_result.rowcount > 0:
             # Only refund if we successfully updated the status
             # Atomic wallet credit
@@ -1372,13 +1372,13 @@ async def execute_wallet_purchase(
         else:
             # Transaction already failed/refunded by another process
             await db_session.rollback()
-        
+
         await adapter.aclose()
         raise  # Re-raise to let caller handle user notification
     finally:
         if 'adapter' in locals():
             await adapter.aclose()
-    
+
     # Success - commit final status
     await db_session.commit()
     return new_tx, sub_url
@@ -1658,7 +1658,7 @@ async def process_partner_wallet_buy(
                 chat_id=user.telegram_id,
                 text="❌ متاسفانه در ارتباط با سرور مشکل پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد."
             )
-    
+
     # Send main menu
     if callback.bot is not None:
         wallet_balance = int(user.wallet_balance)

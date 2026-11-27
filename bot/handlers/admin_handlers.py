@@ -4360,10 +4360,10 @@ async def admin_promote_partner_start(
     await state.update_data(target_user_id=user_id, target_telegram_id=target_user.telegram_id)
     await state.set_state(AdminPartnerStates.waiting_for_min_topup)
 
-    text = f"Promote user {target_user.telegram_id} to partner.\nEnter minimum top-up (Toman):"
+    text = f"✅ <b>ارتقا به همکار</b>\n\n👤 کاربر: {target_user.telegram_id}\n💰 لطفاً حداقل شارژ (تومان) را وارد کنید:"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Cancel", callback_data=f"adm_cust_det_{user_id}")]
+            [InlineKeyboardButton(text="❌ لغو", callback_data=f"adm_cust_det_{user_id}")]
         ]
     )
     if isinstance(callback.message, types.Message):
@@ -4381,23 +4381,34 @@ async def admin_promote_partner_min_topup(
     if not message.text or not message.from_user:
         return
 
+    data = await state.get_data()
+    is_edit = "new_min_topup" in data
+    target_user_id = data.get("target_user_id")
+
     try:
         min_topup = int(message.text.strip())
         if min_topup <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("Amount must be positive. Try again:")
+        await message.answer("❌ مبلغ باید عدد مثبت باشد. مجدداً تلاش کنید:")
         return
 
     await state.update_data(min_topup_toman=min_topup)
     await state.set_state(AdminPartnerStates.waiting_for_discount_percent)
 
-    text = f"Min top-up: {min_topup:,} Toman.\nNow enter discount percent (1-90):"
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Cancel", callback_data="admin_my_customers")]
-        ]
-    )
+    text = f"✅ حداقل شارژ: {min_topup:,} تومان\n📊 لطفاً درصد تخفیف جدید (۱ تا ۹۰) را وارد کنید:"
+    if is_edit:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ لغو", callback_data=f"adm_cust_det_{target_user_id}")]
+            ]
+        )
+    else:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ لغو", callback_data="admin_my_customers")]
+            ]
+        )
     await message.answer(text, reply_markup=kb)
 
 
@@ -4410,28 +4421,27 @@ async def admin_promote_partner_discount_percent(
 
     data = await state.get_data()
     is_edit = "new_min_topup" in data
+    target_user_id = data.get("target_user_id")
+    target_telegram_id = data.get("target_telegram_id")
+    min_topup = data.get("new_min_topup" if is_edit else "min_topup_toman")
 
     try:
         discount = int(message.text.strip())
         if discount < 1 or discount > 90:
             raise ValueError
     except ValueError:
-        await message.answer("Discount must be 1-90. Try again:")
+        await message.answer("❌ درصد تخفیف باید بین ۱ تا ۹۰ باشد. مجدداً تلاش کنید:")
         return
 
     if is_edit:
         await state.update_data(new_discount_percent=discount)
-        min_topup = data.get("new_min_topup")
-        target_telegram_id = data.get("target_telegram_id")
-        target_user_id = data.get("target_user_id")
-
         await state.set_state(AdminPartnerStates.waiting_for_confirm_edit)
 
-        text = f"Confirm edit: min_topup={min_topup:,}, discount={discount}% for user {target_telegram_id}. Confirm?"
+        text = f"✅ <b>تأیید ویرایش شرایط همکار</b>\n\n👤 کاربر: {target_telegram_id}\n💰 حداقل شارژ: {min_topup:,} تومان\n📊 درصد تخفیف: {discount}%\n\nآیا تأیید می‌کنید؟"
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Confirm Edit", callback_data="adm_cust_confirm_edit")],
-                [InlineKeyboardButton(text="Cancel", callback_data="admin_my_customers")]
+                [InlineKeyboardButton(text="✅ تأیید ویرایش", callback_data="adm_cust_confirm_edit")],
+                [InlineKeyboardButton(text="❌ لغو", callback_data=f"adm_cust_det_{target_user_id}")]
             ]
         )
         await message.answer(text, reply_markup=kb)
@@ -4440,14 +4450,11 @@ async def admin_promote_partner_discount_percent(
         await state.update_data(discount_percent=discount)
         await state.set_state(AdminPartnerStates.waiting_for_confirm_promote)
 
-        min_topup = data.get("min_topup_toman")
-        target_telegram_id = data.get("target_telegram_id")
-
-        text = f"Confirm promote: min_topup={min_topup:,}, discount={discount}% for user {target_telegram_id}. Confirm?"
+        text = f"✅ <b>تأیید ارتقا به همکار</b>\n\n👤 کاربر: {target_telegram_id}\n💰 حداقل شارژ: {min_topup:,} تومان\n📊 درصد تخفیف: {discount}%\n\nآیا تأیید می‌کنید؟"
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Confirm Promote", callback_data="adm_cust_confirm_promote")],
-                [InlineKeyboardButton(text="Cancel", callback_data="admin_my_customers")]
+                [InlineKeyboardButton(text="✅ تأیید ارتقا", callback_data="adm_cust_confirm_promote")],
+                [InlineKeyboardButton(text="❌ لغو", callback_data="admin_my_customers")]
             ]
         )
         await message.answer(text, reply_markup=kb)
@@ -4527,10 +4534,10 @@ async def admin_promote_partner_confirm(
     except Exception:
         pass
 
-    text = f"Partner promoted: user {target_telegram_id}, min_topup={min_topup:,}, discount={discount}%"
+    text = f"✅ <b>همکار با موفقیت ارتقا یافت</b>\n\n👤 کاربر: {target_telegram_id}\n💰 حداقل شارژ: {min_topup:,} تومان\n📊 درصد تخفیف: {discount}%"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Back to Details", callback_data=f"adm_cust_det_{target_user_id}")]
+            [InlineKeyboardButton(text="🔙 بازگشت به جزئیات", callback_data=f"adm_cust_det_{target_user_id}")]
         ]
     )
     if isinstance(callback.message, types.Message):
@@ -4581,12 +4588,12 @@ async def admin_edit_partner_start(
         return
 
     await state.update_data(target_user_id=user_id, target_telegram_id=target_user.telegram_id, new_min_topup=partner.min_topup_toman)
-    await state.set_state(AdminPartnerStates.waiting_for_confirm_edit)
+    await state.set_state(AdminPartnerStates.waiting_for_min_topup)
 
-    text = f"Edit partner {target_user.telegram_id}. Current: min_topup={partner.min_topup_toman:,}, discount={partner.discount_percent}%. Enter new min_topup:"
+    text = f"✏️ <b>ویرایش شرایط همکار</b>\n\n👤 کاربر: {target_user.telegram_id}\n📋 وضعیت فعلی: حداقل شارژ = {partner.min_topup_toman:,} تومان، تخفیف = {partner.discount_percent}%\n\n💰 لطفاً حداقل شارژ جدید (تومان) را وارد کنید:"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Cancel", callback_data=f"adm_cust_det_{user_id}")]
+            [InlineKeyboardButton(text="❌ لغو", callback_data=f"adm_cust_det_{user_id}")]
         ]
     )
     if isinstance(callback.message, types.Message):
@@ -4661,10 +4668,10 @@ async def admin_edit_partner_confirm(
 
     await state.clear()
 
-    text = f"Partner updated: user {target_telegram_id}, min_topup={min_topup:,}, discount={discount}%"
+    text = f"✅ <b>شرایط همکار با موفقیت ویرایش شد</b>\n\n👤 کاربر: {target_telegram_id}\n💰 حداقل شارژ: {min_topup:,} تومان\n📊 درصد تخفیف: {discount}%"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Back to Details", callback_data=f"adm_cust_det_{target_user_id}")]
+            [InlineKeyboardButton(text="🔙 بازگشت به جزئیات", callback_data=f"adm_cust_det_{target_user_id}")]
         ]
     )
     if isinstance(callback.message, types.Message):
@@ -4717,11 +4724,11 @@ async def admin_revoke_partner_start(
     await state.update_data(target_user_id=user_id, target_telegram_id=target_user.telegram_id)
     await state.set_state(AdminPartnerStates.waiting_for_confirm_revoke)
 
-    text = f"Revoke partner {target_user.telegram_id}? Current: min_topup={partner.min_topup_toman:,}, discount={partner.discount_percent}%"
+    text = f"⚠️ <b>تأیید لغو همکاری</b>\n\n👤 کاربر: {target_user.telegram_id}\n📋 شرایط فعلی: حداقل شارژ = {partner.min_topup_toman:,} تومان، تخفیف = {partner.discount_percent}%\n\nآیا از لغو همکاری این کاربر مطمئن هستید؟"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Yes, Revoke", callback_data="adm_cust_confirm_revoke")],
-            [InlineKeyboardButton(text="Cancel", callback_data=f"adm_cust_det_{user_id}")]
+            [InlineKeyboardButton(text="✅ بله، لغو شود", callback_data="adm_cust_confirm_revoke")],
+            [InlineKeyboardButton(text="❌ لغو", callback_data=f"adm_cust_det_{user_id}")]
         ]
     )
     if isinstance(callback.message, types.Message):
@@ -4792,10 +4799,10 @@ async def admin_revoke_partner_confirm(
 
     await state.clear()
 
-    text = f"Partner revoked: user {target_telegram_id}"
+    text = f"✅ <b>همکاری لغو شد</b>\n\n👤 کاربر: {target_telegram_id}"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Back to Details", callback_data=f"adm_cust_det_{target_user_id}")]
+            [InlineKeyboardButton(text="🔙 بازگشت به جزئیات", callback_data=f"adm_cust_det_{target_user_id}")]
         ]
     )
     if isinstance(callback.message, types.Message):
@@ -4845,10 +4852,10 @@ async def admin_view_partner_terms(
         await callback.answer("Not an active partner.", show_alert=True)
         return
 
-    text = f"Partner {target_user.telegram_id}: min_topup={partner.min_topup_toman:,}, discount={partner.discount_percent}%, created={partner.created_at.strftime('%Y-%m-%d')}, added_by={partner.added_by}"
+    text = f"🤝 <b>شرایط همکار</b>\n\n👤 کاربر: {target_user.telegram_id}\n💰 حداقل شارژ: {partner.min_topup_toman:,} تومان\n📊 درصد تخفیف: {partner.discount_percent}%\n📅 تاریخ ایجاد: {partner.created_at.strftime('%Y-%m-%d')}\n➕ اضافه شده توسط: {partner.added_by}"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Back to Details", callback_data=f"adm_cust_det_{user_id}")]
+            [InlineKeyboardButton(text="🔙 بازگشت به جزئیات", callback_data=f"adm_cust_det_{user_id}")]
         ]
     )
     if isinstance(callback.message, types.Message):
