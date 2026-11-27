@@ -16,6 +16,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from aiogram.enums import ParseMode
+
 
 from bot.config import BUTTONS, MESSAGES
 from bot.states import PurchaseStates, UserStates, WalletChargeStates
@@ -125,7 +127,7 @@ async def cmd_start(message: types.Message, db_session: AsyncSession) -> None:
         ])
 
     main_menu_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-    await message.answer(text=welcome_text, reply_markup=main_menu_keyboard)
+    await message.answer(text=welcome_text, reply_markup=main_menu_keyboard,parse_mode=ParseMode.HTML)
 
 
 # --- ۲. بازگشت به منوی اصلی ---
@@ -190,7 +192,7 @@ async def process_back_to_main(
 
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(
-            text=welcome_text, reply_markup=main_menu_keyboard
+            text=welcome_text, reply_markup=main_menu_keyboard,parse_mode=ParseMode.HTML
         )
     await callback.answer()
 
@@ -1049,7 +1051,7 @@ async def process_name_entry(
                 )
             ])
         main_menu_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-        await message.answer(text=welcome_text, reply_markup=main_menu_keyboard)
+        await message.answer(text=welcome_text, reply_markup=main_menu_keyboard,parse_mode=ParseMode.HTML)
         await state.clear()
         return
 
@@ -1523,7 +1525,7 @@ async def process_wallet_buy(
         await callback.bot.send_message(
             chat_id=user.telegram_id,
             text=welcome_text,
-            reply_markup=main_menu_keyboard
+            reply_markup=main_menu_keyboard,parse_mode=ParseMode.HTML
         )
 
 
@@ -1702,7 +1704,7 @@ async def process_partner_wallet_buy(
         await callback.bot.send_message(
             chat_id=user.telegram_id,
             text=welcome_text,
-            reply_markup=main_menu_keyboard
+            reply_markup=main_menu_keyboard,parse_mode=ParseMode.HTML
         )
 
 

@@ -62,10 +62,92 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
-
+customer_logger = logging.getLogger(__name__)
 # ==========================================
 # 🌟 توابع کمکی و منوی اصلی
 # ==========================================
+#
+
+async def get_customer_button_label(
+    bot,
+    telegram_id: int,
+    semaphore: asyncio.Semaphore,
+) -> str:
+    """
+    دریافت نام و نام خانوادگی کاربر از تلگرام.
+    در صورت شکست درخواست، شناسه عددی را نمایش می‌دهد.
+    """
+
+    fallback = f"👤 {telegram_id}"
+
+    try:
+        async with semaphore:
+            chat = await bot.get_chat(chat_id=telegram_id)
+
+        first_name = getattr(chat, "first_name", None)
+        last_name = getattr(chat, "last_name", None)
+        username = getattr(chat, "username", None)
+
+        # اولویت اول: نام و نام خانوادگی
+        name_parts = [
+            value.strip()
+            for value in (first_name, last_name)
+            if isinstance(value, str) and value.strip()
+        ]
+
+        display_name = " ".join(name_parts)
+
+        # اولویت دوم: یوزرنیم
+        if not display_name and username:
+            display_name = f"@{username.lstrip('@')}"
+
+        # اگر هیچ اطلاعاتی وجود نداشت
+        if not display_name:
+            return fallback
+
+        prefix = "👤 "
+        suffix = f" | {telegram_id}"
+
+        # محدودیت متن دکمه تلگرام: حداکثر 64 واحد UTF-16
+        fixed_length = (
+            len(prefix.encode("utf-16-le")) // 2
+            + len(suffix.encode("utf-16-le")) // 2
+        )
+
+        available_length = max(1, 64 - fixed_length)
+
+        result = []
+        current_length = 0
+
+        for char in display_name:
+            char_length = len(char.encode("utf-16-le")) // 2
+
+            if current_length + char_length > available_length:
+                break
+
+            result.append(char)
+            current_length += char_length
+
+        shortened_name = "".join(result)
+
+        if len(shortened_name) < len(display_name) and available_length > 0:
+            while current_length + 1 > available_length and result:
+                removed = result.pop()
+                current_length -= len(removed.encode("utf-16-le")) // 2
+
+            shortened_name = "".join(result) + "…"
+
+        return f"{prefix}{shortened_name}{suffix}"
+
+    except Exception as exc:
+        customer_logger.warning(
+            "Could not retrieve Telegram profile for customer %s: %s",
+            telegram_id,
+            exc,
+        )
+
+        return fallback
+
 async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
     stmt = select(Vendor).where(Vendor.telegram_id == user_id)
     vendor = (await db_session.execute(stmt)).scalar_one_or_none()
@@ -3013,22 +3095,38 @@ async def admin_my_customers(callback: types.CallbackQuery, db_session: AsyncSes
 
 
 @router.callback_query(F.data.startswith("adm_cust_list_"))
-async def admin_customers_list(callback: types.CallbackQuery, db_session: AsyncSession):
+async def admin_customers_list(
+    callback: types.CallbackQuery,
+    db_session: AsyncSession,
+):
     if not callback.data or not callback.from_user:
         await callback.answer()
         return
 
-    page_str = callback.data.replace("adm_cust_list_", "")
+    page_str = callback.data.replace("adm_cust_list_", "", 1)
+
     page = int(page_str) if page_str.isdigit() else 1
+
     if page < 1:
         page = 1
 
-    stmt = select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
-    vendor = (await db_session.execute(stmt)).scalar_one_or_none()
+    # پیدا کردن فروشنده
+    stmt = select(Vendor).where(
+        Vendor.telegram_id == callback.from_user.id
+    )
+
+    vendor = (
+        await db_session.execute(stmt)
+    ).scalar_one_or_none()
+
     if not vendor:
-        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        await callback.answer(
+            "❌ فروشنده یافت نشد.",
+            show_alert=True,
+        )
         return
 
+    # دریافت فقط مشتریان صفحه فعلی
     users = (
         (
             await db_session.execute(
@@ -3043,57 +3141,107 @@ async def admin_customers_list(callback: types.CallbackQuery, db_session: AsyncS
         .all()
     )
 
+    # تعداد کل مشتریان برای صفحه‌بندی
     total = await db_session.scalar(
-        select(func.count(User.id)).where(User.vendor_id == vendor.id)
+        select(func.count(User.id)).where(
+            User.vendor_id == vendor.id
+        )
     )
+
     total = int(total or 0)
 
     kb_rows: list[list[InlineKeyboardButton]] = []
-    if not users:
-        text = "👥 <b>لیست مشتریان</b>\n\nهیچ مشتریای یافت نشد."
-        kb_rows.append(
-            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_my_customers")]
-        )
-    else:
-        text = f"👥 <b>لیست مشتریان</b>\n\nصفحه {page} — برای مشاهده جزئیات روی یک کاربر کلیک کنید:"
-        for u in users:
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"👤 {u.telegram_id}", callback_data=f"adm_cust_det_{u.id}"
-                    )
-                ]
-            )
 
+    if not users:
+        text = (
+            "👥 <b>لیست مشتریان</b>\n\n"
+            "هیچ مشتری‌ای یافت نشد."
+        )
+
+        kb_rows.append([
+            InlineKeyboardButton(
+                text="🔙 بازگشت",
+                callback_data="admin_my_customers",
+            )
+        ])
+
+    else:
+        text = (
+            "👥 <b>لیست مشتریان</b>\n\n"
+            f"صفحه {page} — برای مشاهده جزئیات روی یک کاربر کلیک کنید:"
+        )
+
+        # حداکثر 3 درخواست هم‌زمان به تلگرام
+        semaphore = asyncio.Semaphore(3)
+
+        # دریافت نام فقط برای مشتریان همین صفحه
+        button_labels = await asyncio.gather(
+            *[
+                get_customer_button_label(
+                    bot=callback.bot,
+                    telegram_id=int(user.telegram_id),
+                    semaphore=semaphore,
+                )
+                for user in users
+            ]
+        )
+
+        # ساخت دکمه‌ها با حفظ ترتیب و Callback قبلی
+        for user, button_label in zip(users, button_labels):
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=button_label,
+                    callback_data=f"adm_cust_det_{user.id}",
+                )
+            ])
+
+        # صفحه‌بندی؛ بدون تغییر در منطق قبلی
         nav_row: list[InlineKeyboardButton] = []
+
         if page > 1:
             nav_row.append(
                 InlineKeyboardButton(
-                    text="⬅️ قبلی", callback_data=f"adm_cust_list_{page - 1}"
+                    text="⬅️ قبلی",
+                    callback_data=f"adm_cust_list_{page - 1}",
                 )
             )
+
         if total > page * 10:
             nav_row.append(
                 InlineKeyboardButton(
-                    text="➡️ بعدی", callback_data=f"adm_cust_list_{page + 1}"
+                    text="➡️ بعدی",
+                    callback_data=f"adm_cust_list_{page + 1}",
                 )
             )
+
         if nav_row:
             kb_rows.append(nav_row)
 
-        kb_rows.append(
-            [InlineKeyboardButton(text="🔍 جستجو", callback_data="adm_cust_search")]
-        )
-        kb_rows.append(
-            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_my_customers")]
-        )
+        kb_rows.append([
+            InlineKeyboardButton(
+                text="🔍 جستجو",
+                callback_data="adm_cust_search",
+            )
+        ])
+
+        kb_rows.append([
+            InlineKeyboardButton(
+                text="🔙 بازگشت",
+                callback_data="admin_my_customers",
+            )
+        ])
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
     if isinstance(callback.message, types.Message):
         try:
-            await callback.message.edit_text(text, reply_markup=kb)
+            await callback.message.edit_text(
+                text,
+                reply_markup=kb,
+            )
         except TelegramBadRequest:
             pass
+
     await callback.answer()
 
 
@@ -3213,29 +3361,44 @@ async def admin_search_start(callback: types.CallbackQuery, state: FSMContext):
 
 @router.message(AdminCustomerStates.waiting_for_customer_search)
 async def process_customer_search(
-    message: types.Message, state: FSMContext, db_session: AsyncSession
+    message: types.Message,
+    state: FSMContext,
+    db_session: AsyncSession,
 ):
     if not message.text or not message.from_user:
         return
 
-    stmt = select(Vendor).where(Vendor.telegram_id == message.from_user.id)
-    vendor = (await db_session.execute(stmt)).scalar_one_or_none()
+    stmt = select(Vendor).where(
+        Vendor.telegram_id == message.from_user.id
+    )
+    vendor = (
+        await db_session.execute(stmt)
+    ).scalar_one_or_none()
+
     if not vendor:
         await message.answer("❌ فروشنده یافت نشد.")
         await state.clear()
         return
 
+    # Existing search logic — unchanged
     query_text = message.text.strip()
+
     if not query_text.isdigit():
-        await message.answer("❌ برای جستجو شناسه تلگرام عددی ارسال کنید.")
+        await message.answer(
+            "❌ برای جستجو شناسه تلگرام عددی ارسال کنید."
+        )
         return
 
     telegram_id = int(query_text)
+
     users = (
         (
             await db_session.execute(
                 select(User)
-                .where(User.vendor_id == vendor.id, User.telegram_id == telegram_id)
+                .where(
+                    User.vendor_id == vendor.id,
+                    User.telegram_id == telegram_id,
+                )
                 .limit(10)
             )
         )
@@ -3246,24 +3409,56 @@ async def process_customer_search(
     await state.clear()
 
     kb_rows: list[list[InlineKeyboardButton]] = []
+
     if not users:
-        text = "🔍 <b>نتایج جستجو</b>\n\nهیچ کاربری با این شناسه یافت نشد."
+        text = (
+            "🔍 <b>نتایج جستجو</b>\n\n"
+            "هیچ کاربری با این شناسه یافت نشد."
+        )
     else:
-        text = "🔍 <b>نتایج جستجو</b>\n\nبرای مشاهده جزئیات روی کاربر کلیک کنید:"
-        for u in users:
+        text = (
+            "🔍 <b>نتایج جستجو</b>\n\n"
+            "برای مشاهده جزئیات روی کاربر کلیک کنید:"
+        )
+
+        # Reuse the existing helper; do not redefine it.
+        semaphore = asyncio.Semaphore(3)
+
+        button_labels = await asyncio.gather(
+            *[
+                get_customer_button_label(
+                    bot=message.bot,
+                    telegram_id=int(user.telegram_id),
+                    semaphore=semaphore,
+                )
+                for user in users
+            ]
+        )
+
+        for user, button_label in zip(users, button_labels):
             kb_rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"👤 {u.telegram_id}", callback_data=f"adm_cust_det_{u.id}"
+                        text=button_label,
+                        callback_data=f"adm_cust_det_{user.id}",
                     )
                 ]
             )
+
     kb_rows.append(
-        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_my_customers")]
+        [
+            InlineKeyboardButton(
+                text="🔙 بازگشت",
+                callback_data="admin_my_customers",
+            )
+        ]
     )
 
     await message.answer(
-        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=kb_rows,
+        ),
     )
 
 
@@ -3311,7 +3506,7 @@ async def admin_customer_detail(
         f"📅 تاریخ عضویت: {user.created_at.strftime('%Y-%m-%d')}\n"
         f"💰 موجودی کیف پول: <code>{int(user.wallet_balance):,}</code> تومان"
     )
-    
+
     if is_partner_active:
         text += f"\n\n🤝 <b>وضعیت همکار:</b> فعال\n"
         text += f"📊 <b>حداقل شارژ:</b> {partner.min_topup_toman:,} تومان\n"
