@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, update, delete,text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -66,7 +66,548 @@ customer_logger = logging.getLogger(__name__)
 # ==========================================
 # 🌟 توابع کمکی و منوی اصلی
 # ==========================================
-#
+
+def get_owner_telegram_id() -> int | None:
+    raw_owner_id = os.getenv("OWNER_ID")
+
+    if not raw_owner_id:
+        return None
+
+    try:
+        return int(raw_owner_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_bot_owner(callback: types.CallbackQuery) -> bool:
+    owner_id = get_owner_telegram_id()
+
+    return (
+        callback.from_user is not None
+        and owner_id is not None
+        and callback.from_user.id == owner_id
+    )
+
+
+class VendorDeletionError(Exception):
+    pass
+
+
+KNOWN_VENDOR_FKS = {
+    ("vendors", "redirect_to_id"),
+    ("vendors", "redirect_target_id"),
+
+    ("users", "vendor_id"),
+    ("servers", "vendor_id"),
+    ("vendor_servers", "vendor_id"),
+    ("plans", "vendor_id"),
+
+    ("transactions", "vendor_id"),
+    ("transactions", "origin_vendor_id"),
+
+    ("tickets", "vendor_id"),
+    ("discount_codes", "vendor_id"),
+    ("force_join_channels", "vendor_id"),
+}
+
+
+async def assert_known_vendor_references(
+    db_session: AsyncSession,
+) -> None:
+    """
+    جلوگیری از حذف Vendor در صورتی که جدول وابسته ناشناخته‌ای
+    به vendors.id ارجاع داشته باشد.
+    """
+
+    result = await db_session.execute(
+        text("""
+            SELECT DISTINCT
+                tc.table_name,
+                kcu.column_name
+            FROM information_schema.table_constraints tc
+
+            JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_catalog = kcu.constraint_catalog
+                AND tc.constraint_schema = kcu.constraint_schema
+                AND tc.constraint_name = kcu.constraint_name
+
+            JOIN information_schema.constraint_column_usage ccu
+                ON tc.constraint_catalog = ccu.constraint_catalog
+                AND tc.constraint_schema = ccu.constraint_schema
+                AND tc.constraint_name = ccu.constraint_name
+
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema = current_schema()
+              AND ccu.table_schema = current_schema()
+              AND ccu.table_name = 'vendors'
+              AND ccu.column_name = 'id'
+        """)
+    )
+
+    references = {
+        (row[0], row[1])
+        for row in result.all()
+    }
+
+    unknown = references - KNOWN_VENDOR_FKS
+
+    if unknown:
+        details = ", ".join(
+            f"{table}.{column}"
+            for table, column in sorted(unknown)
+        )
+
+        raise VendorDeletionError(
+            f"ارجاع‌های ناشناخته به جدول vendors وجود دارد: {details}"
+        )
+
+
+async def delete_vendor_and_transfer(
+    db_session: AsyncSession,
+    vendor_id: int,
+    owner_telegram_id: int,
+) -> dict:
+    """
+    حذف Vendor و انتقال وابستگی‌های آن به Owner.
+
+    این تابع عملیات را در یک تراکنش دیتابیس انجام می‌دهد.
+    در صورت بروز خطا، کل عملیات Rollback می‌شود.
+    """
+
+    try:
+
+        # --------------------------------------------------
+        # 1. Lock and resolve owner/vendor
+        # --------------------------------------------------
+
+        rows = await db_session.execute(
+            select(Vendor)
+            .where(
+                or_(
+                    Vendor.id == vendor_id,
+                    Vendor.telegram_id == owner_telegram_id,
+                )
+            )
+            .order_by(Vendor.id.asc())
+            .with_for_update()
+        )
+
+        locked_vendors = rows.scalars().all()
+
+        vendor = next(
+            (v for v in locked_vendors if v.id == vendor_id),
+            None,
+        )
+
+        owner = next(
+            (
+                v
+                for v in locked_vendors
+                if v.telegram_id == owner_telegram_id
+            ),
+            None,
+        )
+
+        if owner is None:
+            raise VendorDeletionError(
+                "رکورد Vendor مالک اصلی در دیتابیس پیدا نشد."
+            )
+
+        if vendor is None:
+            raise VendorDeletionError(
+                "شریک موردنظر پیدا نشد."
+            )
+
+        if vendor.id == owner.id:
+            raise VendorDeletionError(
+                "حذف حساب مالک اصلی مجاز نیست."
+            )
+
+        # --------------------------------------------------
+        # 2. Check all foreign key dependencies
+        # --------------------------------------------------
+
+        await assert_known_vendor_references(db_session)
+
+        # --------------------------------------------------
+        # 3. Collect all related server IDs
+        # --------------------------------------------------
+
+        owned_server_ids = set(
+            (
+                await db_session.scalars(
+                    select(Server.id).where(
+                        Server.vendor_id == vendor.id
+                    )
+                )
+            ).all()
+        )
+
+        mapped_server_ids = set(
+            (
+                await db_session.scalars(
+                    select(VendorServer.server_id).where(
+                        VendorServer.vendor_id == vendor.id
+                    )
+                )
+            ).all()
+        )
+
+        partner_plan_server_ids = set(
+            (
+                await db_session.scalars(
+                    select(Plan.server_id).where(
+                        Plan.vendor_id == vendor.id
+                    )
+                )
+            ).all()
+        )
+
+        partner_transaction_server_ids = set(
+            (
+                await db_session.scalars(
+                    select(Transaction.server_id).where(
+                        Transaction.vendor_id == vendor.id,
+                        Transaction.server_id.is_not(None),
+                    )
+                )
+            ).all()
+        )
+
+        server_ids = (
+            owned_server_ids
+            | mapped_server_ids
+            | partner_plan_server_ids
+            | partner_transaction_server_ids
+        )
+
+        # --------------------------------------------------
+        # 4. Lock related servers
+        # --------------------------------------------------
+
+        servers = []
+
+        if server_ids:
+            servers = (
+                await db_session.scalars(
+                    select(Server)
+                    .where(Server.id.in_(server_ids))
+                    .order_by(Server.id.asc())
+                    .with_for_update()
+                )
+            ).all()
+
+        actual_server_ids = {server.id for server in servers}
+
+        # --------------------------------------------------
+        # 5. Find servers referenced by other vendors
+        # --------------------------------------------------
+
+        other_vendor_links = set()
+        other_vendor_plans = set()
+        other_vendor_transactions = set()
+
+        if actual_server_ids:
+
+            link_rows = (
+                await db_session.execute(
+                    select(
+                        VendorServer.server_id,
+                        VendorServer.vendor_id,
+                    ).where(
+                        VendorServer.server_id.in_(actual_server_ids)
+                    )
+                )
+            ).all()
+
+            other_vendor_links = {
+                server_id
+                for server_id, linked_vendor_id in link_rows
+                if linked_vendor_id != vendor.id
+            }
+
+            plan_rows = (
+                await db_session.execute(
+                    select(
+                        Plan.server_id,
+                        Plan.vendor_id,
+                    ).where(
+                        Plan.server_id.in_(actual_server_ids)
+                    )
+                )
+            ).all()
+
+            other_vendor_plans = {
+                server_id
+                for server_id, plan_vendor_id in plan_rows
+                if plan_vendor_id != vendor.id
+            }
+
+            transaction_rows = (
+                await db_session.execute(
+                    select(
+                        Transaction.server_id,
+                        Transaction.vendor_id,
+                    ).where(
+                        Transaction.server_id.in_(actual_server_ids)
+                    )
+                )
+            ).all()
+
+            other_vendor_transactions = {
+                server_id
+                for server_id, transaction_vendor_id in transaction_rows
+                if transaction_vendor_id != vendor.id
+            }
+
+        # --------------------------------------------------
+        # 6. Classify exclusive servers
+        # --------------------------------------------------
+
+        exclusive_server_ids = set()
+
+        for server in servers:
+
+            is_exclusive = (
+                server.vendor_id == vendor.id
+                and not server.is_shared
+                and server.id not in other_vendor_links
+                and server.id not in other_vendor_plans
+                and server.id not in other_vendor_transactions
+            )
+
+            if is_exclusive:
+                exclusive_server_ids.add(server.id)
+
+        surviving_server_ids = (
+            actual_server_ids - exclusive_server_ids
+        )
+
+        # --------------------------------------------------
+        # 7. Transfer or soft-delete servers
+        # --------------------------------------------------
+
+        for server in servers:
+
+            # All references to the deleted vendor must be removed.
+            # The server ownership is transferred to owner.
+
+            server.vendor_id = owner.id
+
+            if server.id in exclusive_server_ids:
+
+                # Preserve financial and historical references.
+                server.is_deleted = True
+                server.is_active = False
+
+            # For shared and other vendors' servers:
+            # - Do NOT delete.
+            # - Keep is_shared unchanged.
+            # - Keep is_active unchanged.
+            # - Transfer ownership to owner.
+
+        await db_session.flush()
+
+        # --------------------------------------------------
+        # 8. Transfer partner plans
+        # --------------------------------------------------
+
+        if exclusive_server_ids:
+
+            # Plans associated with exclusive soft-deleted servers
+            # should also become inactive and soft-deleted.
+
+            await db_session.execute(
+                update(Plan)
+                .where(
+                    Plan.server_id.in_(exclusive_server_ids)
+                )
+                .values(
+                    vendor_id=owner.id,
+                    is_active=False,
+                    is_deleted=True,
+                )
+            )
+
+        # Transfer all remaining plans owned by this vendor.
+        await db_session.execute(
+            update(Plan)
+            .where(Plan.vendor_id == vendor.id)
+            .values(vendor_id=owner.id)
+        )
+
+        # --------------------------------------------------
+        # 9. Transfer all users to owner
+        # --------------------------------------------------
+
+        user_result = await db_session.execute(
+            update(User)
+            .where(User.vendor_id == vendor.id)
+            .values(vendor_id=owner.id)
+        )
+
+        transferred_users = user_result.rowcount or 0
+
+        # --------------------------------------------------
+        # 10. Preserve transaction history
+        # --------------------------------------------------
+
+        transaction_result = await db_session.execute(
+            update(Transaction)
+            .where(Transaction.vendor_id == vendor.id)
+            .values(vendor_id=owner.id)
+        )
+
+        transferred_transactions = transaction_result.rowcount or 0
+
+        # origin_vendor_id is intentionally not rewritten.
+        # Its FK uses ON DELETE SET NULL.
+
+        # --------------------------------------------------
+        # 11. Preserve support tickets
+        # --------------------------------------------------
+
+        ticket_result = await db_session.execute(
+            update(Ticket)
+            .where(Ticket.vendor_id == vendor.id)
+            .values(vendor_id=owner.id)
+        )
+
+        transferred_tickets = ticket_result.rowcount or 0
+
+        # --------------------------------------------------
+        # 12. Transfer redirect destinations
+        # --------------------------------------------------
+
+        await db_session.execute(
+            update(Vendor)
+            .where(
+                Vendor.id != vendor.id,
+                Vendor.redirect_to_id == vendor.id,
+            )
+            .values(redirect_to_id=owner.id)
+        )
+
+        await db_session.execute(
+            update(Vendor)
+            .where(
+                Vendor.id != vendor.id,
+                Vendor.redirect_target_id == vendor.id,
+            )
+            .values(redirect_target_id=owner.id)
+        )
+
+        # --------------------------------------------------
+        # 13. Remove partner VendorServer mappings
+        # --------------------------------------------------
+
+        await db_session.execute(
+            delete(VendorServer).where(
+                VendorServer.vendor_id == vendor.id
+            )
+        )
+
+        # Add Owner mapping to surviving servers, without
+        # creating duplicate mappings.
+
+        if surviving_server_ids:
+
+            existing_owner_links = set(
+                (
+                    await db_session.scalars(
+                        select(VendorServer.server_id).where(
+                            VendorServer.vendor_id == owner.id,
+                            VendorServer.server_id.in_(
+                                surviving_server_ids
+                            ),
+                        )
+                    )
+                ).all()
+            )
+
+            for server_id in surviving_server_ids - existing_owner_links:
+
+                db_session.add(
+                    VendorServer(
+                        vendor_id=owner.id,
+                        server_id=server_id,
+                    )
+                )
+
+        # --------------------------------------------------
+        # 14. Remove vendor-specific configurations
+        # --------------------------------------------------
+
+        # These are vendor-owned configurations.
+        # Transaction.discount_code_id uses ON DELETE SET NULL.
+
+        discount_ids = select(DiscountCode.id).where(
+            DiscountCode.vendor_id == vendor.id
+        )
+
+        await db_session.execute(
+            update(Transaction)
+            .where(Transaction.discount_code_id.in_(discount_ids))
+            .values(discount_code_id=None)
+        )
+
+        await db_session.execute(
+            delete(DiscountCode).where(
+                DiscountCode.vendor_id == vendor.id
+            )
+        )
+
+        await db_session.execute(
+            delete(ForceJoinChannel).where(
+                ForceJoinChannel.vendor_id == vendor.id
+            )
+        )
+
+        # --------------------------------------------------
+        # 15. Finally delete the Vendor row
+        # --------------------------------------------------
+
+        delete_result = await db_session.execute(
+            delete(Vendor)
+            .where(Vendor.id == vendor.id)
+            .execution_options(synchronize_session=False)
+        )
+
+        if delete_result.rowcount != 1:
+            raise VendorDeletionError(
+                "حذف رکورد شریک انجام نشد."
+            )
+
+        # --------------------------------------------------
+        # 16. Commit all operations atomically
+        # --------------------------------------------------
+
+        await db_session.commit()
+
+        stats = {
+            "vendor_id": vendor_id,
+            "owner_vendor_id": owner.id,
+            "users_transferred": transferred_users,
+            "transactions_transferred": transferred_transactions,
+            "tickets_transferred": transferred_tickets,
+            "servers_soft_deleted": len(exclusive_server_ids),
+            "servers_transferred": len(surviving_server_ids),
+        }
+
+        logger.warning(
+            "Vendor deleted and reassigned successfully: %s",
+            stats,
+        )
+
+        return stats
+
+    except Exception:
+        await db_session.rollback()
+        logger.exception(
+            "Failed to delete vendor. vendor_id=%s",
+            vendor_id,
+        )
+        raise
 
 async def get_customer_button_label(
     bot,
@@ -1754,7 +2295,6 @@ async def save_server_with_vendor_sharing(
     server_kwargs["vendor_id"] = owner_vendor_id
     server_kwargs["name"] = srv_name
     server_kwargs["is_shared"] = len(selected_vendor_ids) > 0
-    server_kwargs["is_active"] = True
 
     new_srv = await create_server(db_session, **server_kwargs)
 
@@ -4414,6 +4954,249 @@ async def admin_manage_vendors_menu(
         except TelegramBadRequest:
             pass
     await callback.answer()
+
+
+
+# ==========================================
+# Vendor Details (Owner Only)
+# ==========================================
+
+@router.callback_query(F.data.regexp(r"^adm_ven_\d+$"))
+async def admin_vendor_details(
+    callback: types.CallbackQuery,
+    db_session: AsyncSession,
+):
+    if not is_bot_owner(callback):
+        await callback.answer(
+            "❌ فقط مالک بات اجازه دسترسی دارد.",
+            show_alert=True,
+        )
+        return
+
+    vendor_id = int(callback.data.rsplit("_", 1)[1])
+
+    owner_telegram_id = get_owner_telegram_id()
+
+    if vendor_id <= 0 or owner_telegram_id is None:
+        await callback.answer("شناسه نامعتبر است.", show_alert=True)
+        return
+
+    vendor = await db_session.scalar(
+        select(Vendor).where(Vendor.id == vendor_id)
+    )
+
+    if vendor is None:
+        await callback.answer(
+            "این شریک وجود ندارد یا قبلاً حذف شده است.",
+            show_alert=True,
+        )
+        return
+
+    if vendor.telegram_id == owner_telegram_id:
+        await callback.answer(
+            "حساب مالک اصلی قابل حذف نیست.",
+            show_alert=True,
+        )
+        return
+
+    status = "🟢 فعال" if vendor.is_active else "🔴 غیرفعال"
+
+    text = (
+        "👤 <b>جزئیات شریک</b>\n\n"
+        f"نام: <b>{vendor.name}</b>\n"
+        f"شناسه داخلی: <code>{vendor.id}</code>\n"
+        f"شناسه تلگرام: <code>{vendor.telegram_id}</code>\n"
+        f"وضعیت: {status}\n\n"
+        "برای حذف این شریک، دکمه زیر را انتخاب کنید."
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 حذف شریک",
+                    callback_data=f"adm_ven_delete_{vendor.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔙 بازگشت به فهرست شرکا",
+                    callback_data="owner_manage_vendors",
+                )
+            ],
+        ]
+    )
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=kb,
+        )
+
+    await callback.answer()
+
+# ==========================================
+# Confirm Vendor Deletion
+# ==========================================
+
+@router.callback_query(F.data.regexp(r"^adm_ven_delete_\d+$"))
+async def admin_confirm_vendor_deletion(
+    callback: types.CallbackQuery,
+    db_session: AsyncSession,
+):
+    if not is_bot_owner(callback):
+        await callback.answer(
+            "❌ فقط مالک بات اجازه دسترسی دارد.",
+            show_alert=True,
+        )
+        return
+
+    vendor_id = int(callback.data.rsplit("_", 1)[1])
+
+    owner_telegram_id = get_owner_telegram_id()
+
+    vendor = await db_session.scalar(
+        select(Vendor).where(Vendor.id == vendor_id)
+    )
+
+    if vendor is None:
+        await callback.answer(
+            "شریک موردنظر پیدا نشد.",
+            show_alert=True,
+        )
+        return
+
+    if owner_telegram_id is None or vendor.telegram_id == owner_telegram_id:
+        await callback.answer(
+            "حذف مالک اصلی امکان‌پذیر نیست.",
+            show_alert=True,
+        )
+        return
+
+    text = (
+        "⚠️ <b>تأیید نهایی حذف شریک</b>\n\n"
+        f"نام شریک: <b>{vendor.name}</b>\n"
+        f"شناسه: <code>{vendor.id}</code>\n\n"
+        "با تأیید حذف:\n\n"
+        "✅ کاربران به مالک اصلی منتقل می‌شوند.\n"
+        "✅ مالکیت سرورها به مالک اصلی منتقل می‌شود.\n"
+        "✅ سرورهای اختصاصی شریک غیرفعال و حذف نرم می‌شوند.\n"
+        "✅ پلن‌ها، تراکنش‌ها و تیکت‌ها تعیین تکلیف می‌شوند.\n"
+        "✅ در نهایت رکورد شریک حذف می‌شود.\n\n"
+        "⚠️ این عملیات قابل برگشت مستقیم نیست.\n"
+        "آیا از حذف این شریک مطمئن هستید؟"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ بله، حذف شود",
+                    callback_data=f"adm_ven_delete_confirm_{vendor.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ انصراف",
+                    callback_data=f"adm_ven_{vendor.id}",
+                )
+            ],
+        ]
+    )
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=kb,
+        )
+
+    await callback.answer()
+
+# ==========================================
+# Execute Vendor Deletion (Owner Only)
+# ==========================================
+
+@router.callback_query(
+    F.data.regexp(r"^adm_ven_delete_confirm_\d+$")
+)
+async def admin_execute_vendor_deletion(
+    callback: types.CallbackQuery,
+    db_session: AsyncSession,
+):
+    if not is_bot_owner(callback):
+        await callback.answer(
+            "❌ فقط مالک بات اجازه دسترسی دارد.",
+            show_alert=True,
+        )
+        return
+
+    vendor_id = int(callback.data.rsplit("_", 1)[1])
+
+    owner_telegram_id = get_owner_telegram_id()
+
+    if owner_telegram_id is None:
+        await callback.answer(
+            "تنظیمات OWNER_ID معتبر نیست.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        stats = await delete_vendor_and_transfer(
+            db_session=db_session,
+            vendor_id=vendor_id,
+            owner_telegram_id=owner_telegram_id,
+        )
+
+    except VendorDeletionError as exc:
+        await callback.answer(
+            str(exc)[:180],
+            show_alert=True,
+        )
+        return
+
+    except Exception:
+        logger.exception(
+            "Unexpected vendor deletion error. vendor_id=%s",
+            vendor_id,
+        )
+
+        await callback.answer(
+            "❌ خطای داخلی هنگام حذف شریک رخ داد. هیچ تغییری ثبت نشد.",
+            show_alert=True,
+        )
+        return
+
+    text = (
+        "✅ <b>شریک با موفقیت حذف شد.</b>\n\n"
+        f"شناسه شریک: <code>{stats['vendor_id']}</code>\n\n"
+        "📊 <b>گزارش عملیات:</b>\n"
+        f"👤 کاربران منتقل‌شده: <code>{stats['users_transferred']}</code>\n"
+        f"💳 تراکنش‌های منتقل‌شده: <code>{stats['transactions_transferred']}</code>\n"
+        f"🎫 تیکت‌های منتقل‌شده: <code>{stats['tickets_transferred']}</code>\n"
+        f"🗑 سرورهای حذف نرم‌شده: <code>{stats['servers_soft_deleted']}</code>\n"
+        f"🖥 سرورهای منتقل‌شده: <code>{stats['servers_transferred']}</code>\n\n"
+        "تمام عملیات در یک تراکنش دیتابیس ثبت شده است."
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔙 بازگشت به مدیریت شرکا",
+                    callback_data="owner_manage_vendors",
+                )
+            ]
+        ]
+    )
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=kb,
+        )
+
+    await callback.answer("حذف شریک انجام شد.")
 
 
 @router.callback_query(F.data == "adm_ven_add")
